@@ -23,8 +23,6 @@
 import glob
 import os
 import subprocess
-
-import subprocess
 import sys
 
 def install_torch():
