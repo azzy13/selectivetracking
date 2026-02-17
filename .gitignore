@@ -152,7 +152,6 @@ dataset/
 debug*/
 outputs_compare/
 output/
-docs/
 .claude/
 notebooks_debug/
 dump/
