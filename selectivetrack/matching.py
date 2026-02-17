@@ -6,10 +6,8 @@ from scipy.spatial.distance import cdist
 import torch
 import torch.nn.functional as F
 
-from tracker.ctra_kalman_filter import CTRAKalmanFilter
-
 from cython_bbox import bbox_overlaps as bbox_ious
-from tracker import kalman_filter
+from selectivetrack import kalman_filter
 import time
 
 def merge_matches(m1, m2, shape):
