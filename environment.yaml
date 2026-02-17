@@ -1,0 +1,11 @@
+name: clip_tracker_work
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10.0
+  - pip
+  - pip:
+      - -r requirements.txt
