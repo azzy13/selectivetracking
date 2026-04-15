@@ -179,10 +179,29 @@ class Worker:
         self._mf_hard   = mission_filter_hard
         self._mf_thresh = mission_filter_thresh
 
+        # Fixed tracker type — always ByteTrack in this worker
+        self.tracker_type = 'bytetrack'
+
         print(f"[WorkerSimple] prompt='{text_prompt}' | box_thresh={box_thresh} "
               f"| mission_filter={'on' if use_mission_filter else 'off'} "
               f"| color_reid={'on' if use_color_reid else 'off'} "
               f"| device={self.device}")
+
+    # ------------------------------------------------------------------
+    # Public per-frame API (used by the ROS2 node)
+    # ------------------------------------------------------------------
+
+    def preprocess_frame(self, frame_bgr: np.ndarray) -> torch.Tensor:
+        return self._preprocess(frame_bgr)
+
+    def predict_detections(self, frame_bgr: np.ndarray, tensor_image: torch.Tensor,
+                           orig_h: int, orig_w: int) -> np.ndarray:
+        return self._detect(frame_bgr, tensor_image, orig_h, orig_w)
+
+    def update_tracker(self, dets_xyxy: np.ndarray, orig_h: int, orig_w: int):
+        if dets_xyxy.size == 0:
+            dets_xyxy = np.empty((0, 5), dtype=np.float32)
+        return self.tracker.update(dets_xyxy, [orig_h, orig_w], [orig_h, orig_w])
 
     # ------------------------------------------------------------------
     # Detection

@@ -66,6 +66,7 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/torch/lib:${LD_LIBRA
 # Install remaining dependencies from requirements.txt
 RUN pip3 install --no-cache-dir -r requirements.txt
 
+
 # Build GroundingDINO - Force clean build to ensure CUDA extensions compile
 # Set TORCH_CUDA_ARCH_LIST to force CUDA compilation even without GPU during build
 ENV TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX"
@@ -90,15 +91,18 @@ RUN chmod +x /app/ros2_entrypoint.sh
 # Environment setup
 ENV ROS2_WS=/app/ros2_ws
 ENV GROUNDINGDINO_PATH=/app/GroundingDINO
-ENV PYTHONPATH=${GROUNDINGDINO_PATH}
+ENV PYTHONPATH=${GROUNDINGDINO_PATH}:${GROUNDINGDINO_PATH}/eval
 
 # Create .bashrc that auto-sources ROS2 (for docker exec)
 RUN echo 'source /opt/ros/humble/setup.bash' >> /root/.bashrc && \
     echo 'source /app/ros2_ws/install/setup.bash' >> /root/.bashrc && \
-    echo 'export PYTHONPATH=/app/GroundingDINO:$PYTHONPATH' >> /root/.bashrc && \
+    echo 'export PYTHONPATH=/app/GroundingDINO:/app/GroundingDINO/eval:$PYTHONPATH' >> /root/.bashrc && \
     echo 'export CUDA_HOME=/usr/local/cuda-11.8' >> /root/.bashrc && \
     echo 'export PATH=$CUDA_HOME/bin:$PATH' >> /root/.bashrc && \
     echo 'export LD_LIBRARY_PATH=$CUDA_HOME/lib64:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH' >> /root/.bashrc
+
+# Set working directory to GroundingDINO root so relative paths work
+WORKDIR /app/GroundingDINO
 
 # Expose ROS2 DDS ports
 EXPOSE 7400-7500/udp

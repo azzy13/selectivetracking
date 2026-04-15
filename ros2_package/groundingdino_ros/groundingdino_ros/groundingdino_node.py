@@ -21,7 +21,7 @@ import numpy as np
 GROUNDINGDINO_ROOT = Path(__file__).parent.parent.parent.parent.parent
 sys.path.insert(0, str(GROUNDINGDINO_ROOT))
 
-from eval.worker import Worker
+from worker_simple import Worker
 from groundingdino_ros.msg import GroundingDINOTrack, GroundingDINOTrackArray
 
 # Import mission parser (same directory when installed)
@@ -108,15 +108,11 @@ class GroundingDINONode(Node):
         self.declare_parameter('box_threshold', 0.42)
         self.declare_parameter('text_threshold', 0.50)
 
-        # Tracker configuration
-        self.declare_parameter('tracker_type', 'bytetrack')  # bytetrack or clip
+        # Tracker configuration (ByteTrack only)
+        self.declare_parameter('tracker_type', 'bytetrack')
         self.declare_parameter('track_thresh', 0.5)
         self.declare_parameter('track_buffer', 30)
         self.declare_parameter('match_thresh', 0.8)
-
-        # CLIP tracker specific
-        self.declare_parameter('lambda_weight', 0.25)
-        self.declare_parameter('text_sim_thresh', 0.20)
 
         # Input/output
         self.declare_parameter('camera_topic', '/viaduct/Sim/SceneDroneSensors/robots/Drone1/sensors/front_center1/scene_camera/image')
@@ -149,29 +145,20 @@ class GroundingDINONode(Node):
     def _init_worker(self) -> Worker:
         """Initialize Worker instance with ROS2 parameters."""
 
-        # Get tracker-specific kwargs
         tracker_kwargs = {
             'track_thresh': self.get_parameter('track_thresh').value,
             'track_buffer': self.get_parameter('track_buffer').value,
             'match_thresh': self.get_parameter('match_thresh').value,
         }
 
-        # Add CLIP-specific params if using CLIP tracker
-        if self.get_parameter('tracker_type').value == 'clip':
-            tracker_kwargs['lambda_weight'] = self.get_parameter('lambda_weight').value
-            tracker_kwargs['text_sim_thresh'] = self.get_parameter('text_sim_thresh').value
-
-        # Create Worker instance
         worker = Worker(
             config_path=self.get_parameter('model_config').value,
             weights_path=self.get_parameter('model_weights').value,
             text_prompt=self.text_prompt,
-            detector='dino',
             box_thresh=self.get_parameter('box_threshold').value,
             text_thresh=self.get_parameter('text_threshold').value,
             use_fp16=self.get_parameter('use_fp16').value,
             device=self.get_parameter('device').value,
-            tracker_type=self.get_parameter('tracker_type').value,
             tracker_kwargs=tracker_kwargs,
             frame_rate=self.get_parameter('frame_rate').value,
         )
@@ -216,15 +203,8 @@ class GroundingDINONode(Node):
                 orig_w=orig_w
             )
 
-            # Run tracking (different method for CLIP vs ByteTrack)
-            if self.worker.tracker_type == 'clip':
-                tracks = self.worker.update_tracker_clip(
-                    dets_xyxy, frame, orig_h, orig_w
-                )
-            else:
-                tracks = self.worker.update_tracker(
-                    dets_xyxy, orig_h, orig_w
-                )
+            # Run tracking (ByteTrack via worker_simple)
+            tracks = self.worker.update_tracker(dets_xyxy, orig_h, orig_w)
 
             # Publish tracking results
             self._publish_tracks(tracks, msg.header, orig_h, orig_w)

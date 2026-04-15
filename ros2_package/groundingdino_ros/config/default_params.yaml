@@ -2,7 +2,7 @@ groundingdino_node:
   ros__parameters:
     # Model configuration
     model_config: "/app/GroundingDINO/groundingdino/config/GroundingDINO_SwinB_cfg.py"
-    model_weights: "/app/groundingdino/weights/swinb_light_visdrone_ft_best.pth"
+    model_weights: "/app/GroundingDINO/groundingdino/weights/groundingdino_swinb_cogcoor.pth"
     device: "cuda"
     use_fp16: true
 
