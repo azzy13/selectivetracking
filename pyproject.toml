@@ -1,0 +1,36 @@
+[build-system]
+# We still use setuptools as the backend because of the CUDA extensions
+requires = ["setuptools>=61.0", "wheel", "torch", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "groundingdino"
+version = "0.1.0"
+description = "open-set object detector"
+authors = [
+    {name = "Shilong Liu", email = "shilongliu.cv@gmail.com"},
+    {name = "International Digital Economy Academy"}
+]
+license = {file = "LICENSE"}
+readme = "README.md"
+requires-python = ">=3.10"
+# These match your requirements.txt logic
+dependencies = [
+    "torch>=2.2",
+    "torchvision",
+    "numpy",
+    "opencv-python",
+    "supervision",
+    "pycocotools",
+    "transformers",
+    "addict",
+    "yapf",
+    "timm"
+]
+
+[tool.setuptools]
+packages = {find = {exclude = ["configs", "tests"]}}
+
+[tool.setuptools.exclude-package-data]
+"*" = ["configs*", "tests*"]
+

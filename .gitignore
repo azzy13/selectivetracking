@@ -156,3 +156,6 @@ docs/
 .claude/
 notebooks_debug/
 dump/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
