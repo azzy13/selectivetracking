@@ -1,0 +1,88 @@
+[workspace]
+authors = ["Di Yao <di.yao@vanderbilt.edu>"]
+channels = ["pytorch", "nvidia", "conda-forge"]
+# channels = ["conda-forge", "pytorch", "nvidia"]
+channel-priority = "disabled"
+name = "selectivetracking"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[system-requirements]
+linux = "5.15"
+cuda = "12.1"
+
+[tasks]
+
+[activation]
+
+
+[tasks.demo]
+cmd = "python3 demo/inference_w_worker.py --video ../videos/carla1.mp4 --output ../output_2/annotated.mp4 --text-prompt \"red car.\" --fp16"
+
+[tasks.cuda-check]
+cmd = "python3 scripts/cuda-check.py"
+
+[tasks.build]
+cmd = "pip install -e . --no-build-isolation"
+[tasks.build.env]
+package_name = "groundingdino"
+FORCE_CUDA = "1"
+CUDA_HOME = "$CONDA_PREFIX"
+CPATH = "$CONDA_PREFIX/include"
+LIBRARY_PATH = "$CONDA_PREFIX/lib"
+# These help the linker find the actual .so files
+LDFLAGS = "-L$CONDA_PREFIX/lib -Wl,-rpath,$CONDA_PREFIX/lib"
+TORCH_CUDA_ARCH_LIST = "8.0;8.6;8.9"
+NVCC_FLAGS = "--use_fast_math __CUDA_NO_HALF_OPERATORS__ __CUDA_NO_HALF_CONVERSIONS__ __CUDA_NO_HALF2_OPERATORS__"
+
+[tasks.nuclear]
+cmd = "bash scripts/nu-clear.sh"
+
+
+[dependencies]
+python = "3.10.*"
+pip = ">=26.0.1,<27"
+# Force these to come from the pytorch channel only
+pytorch = { version = ">=2.1.0", channel = "pytorch" }
+cuda-toolkit = "12.1.*"
+cuda-compiler = "12.1.*"
+torchvision = { version = "*", channel = "pytorch" }
+# Force this to come from the nvidia channel
+pytorch-cuda = { version = "12.1.*", channel = "pytorch" }
+
+# Build tools for your Custom C++ Ops
+cuda-nvcc = { version = "12.1.*", channel = "nvidia" }
+gxx_linux-64 = "11.*"
+
+# Common DS stack
+numpy = ">=1.26.2"
+opencv = "*"
+timm = "*"
+transformers = ">=4.49.0"
+supervision = ">=0.22.0"
+
+# Remove 'cuda = "*"' and 'cuda-version = "*"' as they are redundant with pytorch-cuda
+# Keep the rest of your dependencies below...
+setuptools = ">=82.0.1,<83"
+ipykernel = "*"
+lap = "*"
+pandas = "*"
+motmetrics = "*"
+accelerate = "*"
+einops = "*"
+addict = "*"
+yapf = "*"
+pycocotools = "*"
+cuda-cudart-dev = { version = ">=12.1.105,<13", channel = "nvidia" }
+ninja = ">=1.13.2,<2"
+libcusparse-dev = { version = ">=12.0.2.55,<13", channel = "nvidia" }
+libcurand-dev = { version = ">=10.3.10.19,<11", channel = "nvidia" }
+libcublas-dev = { version = ">=12.1.0.26,<13", channel = "nvidia" }
+libcublas = { version = ">=12.1.0.26,<13", channel = "nvidia" }
+libcusolver-dev = { version = ">=11.4.4.55,<12", channel = "nvidia" }
+libcusolver = { version = ">=11.4.4.55,<12", channel = "nvidia" }
+
+
+[pypi-dependencies]
+cython_bbox = "*"
+clip = "*"
