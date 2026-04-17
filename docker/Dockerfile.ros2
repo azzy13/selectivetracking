@@ -74,6 +74,29 @@ RUN rm -rf build/ dist/ *.egg-info groundingdino/_C.*.so && \
     python3 setup.py clean --all && \
     FORCE_CUDA=1 pip3 install -v --no-build-isolation -e .
 
+# Install MoGe-2 depth model and its non-PyPI dependencies
+# pipeline, utils3d, and moge all use vcs-versioning — without full git history in Docker
+# they resolve to UNKNOWN-0.0.0 and pip skips subsequent installs thinking the package
+# is already present. Workaround: clone each repo and copy the module directory directly.
+
+# PyPI deps for moge/utils3d that are safe to install normally
+RUN pip3 install --no-cache-dir trimesh huggingface_hub moderngl
+
+RUN git clone https://github.com/EasternJournalist/pipeline.git /tmp/pipeline_src && \
+    cd /tmp/pipeline_src && git checkout 866f059d2a05cde05e4a52211ec5051fd5f276d6 && \
+    cp -r pipeline /usr/local/lib/python3.10/dist-packages/ && \
+    rm -rf /tmp/pipeline_src
+
+RUN git clone https://github.com/EasternJournalist/utils3d.git /tmp/utils3d_src && \
+    cd /tmp/utils3d_src && git checkout 3fab839f0be9931dac7c8488eb0e1600c236e183 && \
+    cp -r utils3d /usr/local/lib/python3.10/dist-packages/ && \
+    rm -rf /tmp/utils3d_src
+
+RUN git clone https://github.com/microsoft/MoGe.git /tmp/moge_src && \
+    cd /tmp/moge_src && git checkout 07444410f1e33f402353b99d6ccd26bd31e469e8 && \
+    cp -r moge /usr/local/lib/python3.10/dist-packages/ && \
+    rm -rf /tmp/moge_src
+
 # Stage 3: Build ROS2 workspace
 WORKDIR /app/ros2_ws
 

@@ -40,7 +40,40 @@ docker run \
   groundingdino_ros:latest
 ```
 
-### 4. Test with Sample Video (In Another Terminal)
+### 4. Run Inference on a Video
+
+Basic inference (detection + tracking):
+```bash
+docker run --rm --gpus all \
+  -v ${PWD}/weights:/app/GroundingDINO/weights:ro \
+  -v ${PWD}/videos:/app/GroundingDINO/videos:ro \
+  -v ${PWD}/outputs:/app/GroundingDINO/outputs:rw \
+  groundingdino_ros:latest \
+  python3 demo/inference_w_worker.py \
+    --video videos/carla1.mp4 \
+    --output outputs/carla1_tracked.mp4 \
+    --fp16 \
+    --text-prompt "car. "
+```
+
+With MoGe-2 depth estimation (adds distance overlay on each bbox):
+```bash
+docker run --rm --gpus all \
+  -v ${PWD}/weights:/app/GroundingDINO/weights:ro \
+  -v ${PWD}/videos:/app/GroundingDINO/videos:ro \
+  -v ${PWD}/outputs:/app/GroundingDINO/outputs:rw \
+  groundingdino_ros:latest \
+  python3 demo/inference_w_worker.py \
+    --video videos/carla1.mp4 \
+    --output outputs/carla1_depth.mp4 \
+    --fp16 \
+    --text-prompt "car." \
+    --depth
+```
+
+Output video lands in `outputs/` on your host. Change `--text-prompt` (default: `"red car."`) to detect different objects.
+
+### 6. Test with Sample Video (ROS2 — In Another Terminal)
 
 ```bash
 docker run -d \
@@ -54,7 +87,7 @@ docker run -d \
            python3 test_publisher.py --video /app/groundingdino/videos/carla1.mp4 --fps 30"
 ```
 
-### 5. Verify It's Working
+### 7. Verify It's Working
 
 ```bash
 # Check topics are publishing
