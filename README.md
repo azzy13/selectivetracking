@@ -21,8 +21,8 @@ Built on top of [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO),
 **Requirements:** Python 3.10, CUDA-capable GPU
 
 ```bash
-git clone https://github.com/azzy13/GroundingDINO.git
-cd GroundingDINO
+git clone https://github.com/azzy13/selectivetracking.git
+cd selectivetracking
 
 conda create -n env_dino python=3.10
 conda activate env_dino
@@ -142,7 +142,7 @@ The CARLA Referring Target Evaluation Set is available on Hugging Face:
 
 A synthetic benchmark for **referring expression tracking** — the task of tracking a single described target (e.g. "red sedan") while ignoring all other vehicles in the scene. Unlike standard MOT datasets that evaluate all objects, this benchmark tests whether a tracker can isolate and follow exactly the object that matches the natural language description across challenging conditions including weather variation, lighting changes, camera motion, and the presence of visually similar distractors.
 
-24 scenarios generated in CARLA simulator (Towns 10HD, 03, 05). Each scenario provides per-frame ground-truth bounding boxes with `is_target` flags distinguishing the referred object from distractors.
+24 scenarios generated in CARLA simulator (Towns 10HD, 03, 05). The paper-reported benchmark uses the first 18 scenarios; this repository's released set expands that benchmark to 24 by adding follow-camera variants. Each scenario provides per-frame ground-truth bounding boxes with `is_target` flags distinguishing the referred object from distractors.
 
 **Evaluation metrics** (computed by `eval_carla.py`):
 
