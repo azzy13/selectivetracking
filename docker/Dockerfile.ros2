@@ -63,16 +63,41 @@ RUN pip3 install --no-cache-dir \
 # Update LD_LIBRARY_PATH to include PyTorch libs (needed for CUDA extensions)
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/torch/lib:${LD_LIBRARY_PATH}
 
-# Install remaining dependencies from requirements.txt
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Install remaining dependencies.  The file is r.txt, not requirements.txt.
+RUN pip3 install --no-cache-dir -r r.txt
 
 
-# Build GroundingDINO - Force clean build to ensure CUDA extensions compile
-# Set TORCH_CUDA_ARCH_LIST to force CUDA compilation even without GPU during build
+# Build GroundingDINO from the upstream project.
+#
+# It used to be built from this repository, out of a vendored copy under
+# groundingdino/.  That copy is gone: the fixes it carried are pull requests
+# against IDEA-Research/GroundingDINO, and what remains here is only the two
+# model config files, which are read by path.
+#
+# The clone is pinned to the branch carrying those fixes until they are merged
+# upstream; repoint it at IDEA-Research once they are.
+#
+# TORCH_CUDA_ARCH_LIST forces the CUDA extension to compile even though the
+# build host has no GPU, which is what lets this image be built in CI.
 ENV TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX"
-RUN rm -rf build/ dist/ *.egg-info groundingdino/_C.*.so && \
-    python3 setup.py clean --all && \
-    FORCE_CUDA=1 pip3 install -v --no-build-isolation -e .
+RUN git clone --depth 1 --branch integration/split-fixes \
+        https://github.com/phreed/GroundingDINO.git /app/groundingdino-src && \
+    cd /app/groundingdino-src && \
+    FORCE_CUDA=1 pip3 install -v --no-build-isolation . && \
+    rm -rf /app/groundingdino-src
+
+# Install this project.  Pure Python now, and --no-deps because its
+# groundingdino-py requirement is satisfied by the build above rather than from
+# an index.
+RUN pip3 install --no-cache-dir --no-deps -e .
+
+# The installed package must win over the ./groundingdino config directory.
+# It does because that directory has no __init__.py, so it is only a namespace
+# portion and loses to a regular package found later on sys.path -- but this is
+# load-bearing enough to assert at build time rather than discover at run time.
+RUN python3 -c "import groundingdino, sys; p = groundingdino.__file__ or ''; \
+    sys.exit(0) if 'site-packages' in p or 'dist-packages' in p else \
+    sys.exit(f'groundingdino resolved to {p!r}, not the installed package')"
 
 # Install MoGe-2 depth model and its non-PyPI dependencies
 # pipeline, utils3d, and moge all use vcs-versioning — without full git history in Docker
