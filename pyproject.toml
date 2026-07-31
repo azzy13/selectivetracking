@@ -1,36 +1,116 @@
 [build-system]
-# We still use setuptools as the backend because of the CUDA extensions
-requires = ["setuptools>=82.0.1,<83", "wheel", "setuptools_scm"]
-build-backend = "setuptools.build_meta"
+# Pure Python now.  The CUDA extension used to be built by this project's own
+# setup.py against the vendored groundingdino/ tree; it comes from the
+# groundingdino-py-cuda conda package instead, so there is nothing left to
+# compile and no reason to keep setuptools' build machinery.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
-name = "groundingdino"
+# This project is SelectiveTracking.  It called itself `groundingdino` only
+# because it was built from GroundingDINO's own pyproject, which is exactly the
+# confusion the split removes.
+name = "selectivetracking"
 version = "0.1.0"
-description = "open-set object detector"
+description = "Selective multi-object tracking with open-vocabulary detection"
 authors = [
-    {name = "Shilong Liu", email = "shilongliu.cv@gmail.com"},
-    {name = "International Digital Economy Academy"}
+    {name = "Di Yao", email = "di.yao@vanderbilt.edu"},
 ]
 license = {file = "LICENSE"}
 readme = "README.md"
 requires-python = ">=3.10"
-# These match your requirements.txt logic
+
+# groundingdino is a dependency now, not a subdirectory.
 dependencies = [
+    "groundingdino-py>=0.4.1",
     "torch>=2.1.0",
     "torchvision",
-    "numpy",
+    "numpy>=1.26.2",
     "opencv-python",
-    "supervision",
+    "supervision>=0.22.0",
     "pycocotools",
-    "transformers",
-    "addict",
-    "yapf",
-    "timm"
+    "transformers>=4.49.0",
+    "timm",
+    "pandas",
+    "motmetrics",
+    "lap",
 ]
 
-[tool.setuptools]
-packages = {find = {exclude = ["configs", "tests"]}}
+[tool.hatch.build.targets.wheel]
+# `groundingdino/` is deliberately absent.  What survives there is two model
+# config files, read by path at run time, belonging to no package -- and the
+# directory has no `__init__.py`, so it stays a namespace portion that loses to
+# the installed regular package.  Shipping it would put a second `groundingdino`
+# on sys.path.
+packages = ["eval", "tracker", "utils", "helper"]
 
-[tool.setuptools.exclude-package-data]
-"*" = ["configs*", "tests*"]
+# ── pixi ─────────────────────────────────────────────────────────────────────
+# Merged from the standalone pixi.toml, which is deleted.  One file now
+# describes this project to both pip and pixi; two files stating the same
+# dependency set is how they drift apart.
 
+[tool.pixi.workspace]
+authors = ["Di Yao <di.yao@vanderbilt.edu>"]
+channels = ["conda-forge", "pytorch", "nvidia"]
+name = "selectivetracking"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tool.pixi.system-requirements]
+linux = "5.15"
+cuda = "12.1"
+
+[tool.pixi.pypi-dependencies]
+selectivetracking = { path = ".", editable = true }
+cython_bbox = "*"
+clip = "*"
+
+[tool.pixi.dependencies]
+python = "3.10.*"
+pip = ">=26.0.1,<27"
+
+# The detector, as a package.  `-cuda` carries the compiled deformable-attention
+# extension; swap it for `groundingdino-py-cpu` on a machine with no NVIDIA GPU
+# -- the model then takes the pure-PyTorch fallback, which is correct but slow
+# and must stay in float32, since grid_sample has no half-precision CPU kernel.
+groundingdino-py = ">=0.4.1"
+groundingdino-py-cuda = "*"
+
+pytorch = { version = ">=2.1.0", channel = "pytorch" }
+torchvision = { version = "*", channel = "pytorch" }
+pytorch-cuda = { version = "12.1.*", channel = "pytorch" }
+
+# The build toolchain that used to live here -- cuda-nvcc, cuda-toolkit,
+# gxx_linux-64, ninja, and the libcublas / libcusolver / libcusparse / libcurand
+# -dev packages -- is gone.  It was here only to compile the vendored extension,
+# and the package ships that already built.
+numpy = ">=1.26.2"
+opencv = "*"
+timm = "*"
+transformers = ">=4.49.0"
+supervision = ">=0.22.0"
+ipykernel = "*"
+lap = "*"
+pandas = "*"
+motmetrics = "*"
+accelerate = "*"
+einops = "*"
+addict = "*"
+yapf = "*"
+pycocotools = "*"
+
+[tool.pixi.tasks.demo]
+cmd = "python3 demo/inference_w_worker.py --video ../videos/carla1.mp4 --output ../output_2/annotated.mp4 --text-prompt \"red car.\" --fp16"
+description = "Run inference on a sample CARLA video with the 'red car' prompt"
+
+[tool.pixi.tasks.cuda-check]
+cmd = "python3 scripts/cuda-check.py"
+description = "Verify CUDA availability and print GPU/driver info"
+
+[tool.pixi.tasks.nuclear]
+cmd = "bash scripts/nu-clear.sh"
+description = "Remove all build artifacts and caches for a clean slate"
+
+# `build` is gone with setup.py: there is no extension to compile here any more.
+# `conda-build` is gone too -- recipe.yaml built the detector, which the
+# feedstock now owns.
