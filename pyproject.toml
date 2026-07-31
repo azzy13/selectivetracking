@@ -20,21 +20,19 @@ license = {file = "LICENSE"}
 readme = "README.md"
 requires-python = ">=3.10"
 
-# groundingdino is a dependency now, not a subdirectory.
-dependencies = [
-    "groundingdino-py>=0.4.1",
-    "torch>=2.1.0",
-    "torchvision",
-    "numpy>=1.26.2",
-    "opencv-python",
-    "supervision>=0.22.0",
-    "pycocotools",
-    "transformers>=4.49.0",
-    "timm",
-    "pandas",
-    "motmetrics",
-    "lap",
-]
+# Deliberately empty.  This is an application, installed as an editable package
+# into a pixi environment, and [tool.pixi.dependencies] below is the single
+# authoritative dependency list.
+#
+# Stating them here as well makes pixi resolve the same names a second time
+# against PyPI, which fails and would be wrong even if it succeeded:
+#
+#   * groundingdino-py on PyPI is 0.4.0 and does not carry the fixes this
+#     project contributed.  The 0.4.1 that does comes from the conda feedstock,
+#     and will only reach PyPI when upstream cuts a release.
+#   * torch from PyPI beside pytorch from conda puts two builds of the same
+#     library in one environment.
+dependencies = []
 
 [tool.hatch.build.targets.wheel]
 # `groundingdino/` is deliberately absent.  What survives there is two model
@@ -51,14 +49,20 @@ packages = ["eval", "tracker", "utils", "helper"]
 
 [tool.pixi.workspace]
 authors = ["Di Yao <di.yao@vanderbilt.edu>"]
-channels = ["conda-forge", "pytorch", "nvidia"]
+# The local channel carries groundingdino-py until the feedstock publishes it.
+#
+# The `pytorch` and `nvidia` channels are gone, and with them the
+# `channel-priority = "disabled"` that pixi.toml needed to make the three
+# co-exist.  groundingdino-py-cuda is built against conda-forge's CUDA pytorch,
+# so pulling pytorch from the `pytorch` channel would put two different builds
+# of the same library in one environment.  One channel, one pytorch.
+channels = ["./../local-channel", "conda-forge"]
 name = "selectivetracking"
-platforms = ["linux-64"]
 version = "0.1.0"
 
-[tool.pixi.system-requirements]
-linux = "5.15"
-cuda = "12.1"
+# The CUDA requirement rides on the platform entry; the [system-requirements]
+# table pixi.toml used for it is deprecated.
+platforms = [{ platform = "linux-64", linux = "5.15", cuda = "12.1" }]
 
 [tool.pixi.pypi-dependencies]
 selectivetracking = { path = ".", editable = true }
@@ -76,9 +80,12 @@ pip = ">=26.0.1,<27"
 groundingdino-py = ">=0.4.1"
 groundingdino-py-cuda = "*"
 
-pytorch = { version = ">=2.1.0", channel = "pytorch" }
-torchvision = { version = "*", channel = "pytorch" }
-pytorch-cuda = { version = "12.1.*", channel = "pytorch" }
+# groundingdino-py-cuda already requires `pytorch *cuda*`, so the CUDA build is
+# selected by the detector rather than pinned here.  `pytorch-cuda` is gone: it
+# is the `pytorch` channel's way of expressing this, and conda-forge uses the
+# build string plus `cuda-version` instead.
+pytorch = ">=2.1.0"
+torchvision = "*"
 
 # The build toolchain that used to live here -- cuda-nvcc, cuda-toolkit,
 # gxx_linux-64, ninja, and the libcublas / libcusolver / libcusparse / libcurand
