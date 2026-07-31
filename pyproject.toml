@@ -73,10 +73,12 @@ clip = "*"
 python = "3.10.*"
 pip = ">=26.0.1,<27"
 
-# The detector, as a package.  `-cuda` carries the compiled deformable-attention
-# extension; swap it for `groundingdino-py-cpu` on a machine with no NVIDIA GPU
-# -- the model then takes the pure-PyTorch fallback, which is correct but slow
-# and must stay in float32, since grid_sample has no half-precision CPU kernel.
+# The detector, as a package.  `groundingdino-py` is the detector itself, pure
+# Python; `-cuda` adds the compiled deformable-attention extension.
+#
+# On a machine with no NVIDIA GPU, drop the `-cuda` line -- that is all.  The
+# model then takes the pure-PyTorch fallback, which is correct but slow, and must
+# stay in float32 since grid_sample has no half-precision CPU kernel.
 groundingdino-py = ">=0.4.1"
 groundingdino-py-cuda = "*"
 
