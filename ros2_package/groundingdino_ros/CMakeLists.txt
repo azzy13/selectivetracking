@@ -32,6 +32,8 @@ install(PROGRAMS
 install(FILES
   ${PROJECT_NAME}/groundingdino_node.py
   ${PROJECT_NAME}/mission_parser.py
+  ${PROJECT_NAME}/geometry.py
+  ${PROJECT_NAME}/perception_publisher.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
