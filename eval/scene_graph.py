@@ -33,7 +33,8 @@ from query_grounding import ROLE_ANCHOR, ROLE_TARGET
 # LAB color classifier
 # ---------------------------------------------------------------------------
 
-def _classify_lab_patch(L: float, a_raw: float, b_raw: float) -> str:
+def _classify_lab_patch(L: float, a_raw: float, b_raw: float,
+                        gt_vocabulary: bool = False) -> str:
     """Classify one mean-LAB patch value into a color name.
 
     Uses CIE L*a*b* instead of HSV because:
@@ -44,6 +45,21 @@ def _classify_lab_patch(L: float, a_raw: float, b_raw: float) -> str:
 
     OpenCV stores LAB as uint8 with L in [0,255] and a,b in [0,255]
     centered at 128, so a and b are shifted back to the signed range here.
+
+    gt_vocabulary=True switches to hue bins measured against the benchmark's
+    colour vocabulary (red, orange, yellow, green, blue, violet, white,
+    black) and is what the ROS2 perception output uses.  It differs from the
+    default in three ways:
+
+      - violet is split out of blue (measured: violet -48..-44 deg,
+        blue -74..-54 deg -- adjacent but separable at -51),
+      - the orange/yellow/green bounds are moved to where those hues
+        actually land (measured yellow is 97..103 deg, which the default
+        bins call green),
+      - achromatic dark/light are named black/white.
+
+    It is off by default so the offline eval path keeps the exact bins its
+    numbers were produced with.
     """
     a = a_raw - 128.0  # signed: negative=green, positive=red
     b = b_raw - 128.0  # signed: negative=blue,  positive=yellow
@@ -55,6 +71,23 @@ def _classify_lab_patch(L: float, a_raw: float, b_raw: float) -> str:
     # (e.g. shadowed or distant car panels) are not dropped as achromatic.
     if chroma >= 15:
         angle = math.degrees(math.atan2(b, a))  # [-180, 180]
+
+        if gt_vocabulary:
+            # Explicit bounds on every branch: an open-ended "angle < 82"
+            # would also swallow every negative (blue/violet) angle.
+            if -15 <= angle < 48:
+                return "red"
+            elif 48 <= angle < 82:
+                return "orange"
+            elif 82 <= angle < 120:
+                return "yellow"
+            elif 120 <= angle < 160:
+                return "green"
+            elif -51 <= angle < -15:
+                return "violet"
+            else:                      # 160..180 and -180..-51
+                return "blue"
+
         # Red:    -30 to  45  (a* >> 0; extended to catch warm/orange-red;
         #                       real red cars in CARLA land at ~20-35°)
         # Orange:  45 to  65
@@ -74,13 +107,14 @@ def _classify_lab_patch(L: float, a_raw: float, b_raw: float) -> str:
 
     # Achromatic: classify by lightness (L in [0, 255] in OpenCV)
     if L < 80:
-        return "dark"
+        return "black" if gt_vocabulary else "dark"
     elif L > 200:
-        return "light"
+        return "white" if gt_vocabulary else "light"
     return "gray"
 
 
-def _dominant_color_from_crop(crop_bgr: np.ndarray, grid_size: int = 4):
+def _dominant_color_from_crop(crop_bgr: np.ndarray, grid_size: int = 4,
+                              gt_vocabulary: bool = False):
     """Return (dominant_color_str, votes_dict) using patch-based LAB voting."""
     if crop_bgr is None or crop_bgr.size == 0:
         return "unknown", {}
@@ -101,7 +135,7 @@ def _dominant_color_from_crop(crop_bgr: np.ndarray, grid_size: int = 4):
             if patch.size == 0:
                 continue
             mean_px = np.mean(patch.reshape(-1, 3), axis=0)
-            color = _classify_lab_patch(*mean_px)
+            color = _classify_lab_patch(*mean_px, gt_vocabulary=gt_vocabulary)
             votes[color] = votes.get(color, 0) + 1
 
     if not votes:
@@ -111,7 +145,8 @@ def _dominant_color_from_crop(crop_bgr: np.ndarray, grid_size: int = 4):
 
 
 def _get_track_color(frame_bgr: np.ndarray, x: float, y: float,
-                     w: float, h: float) -> tuple[str, dict]:
+                     w: float, h: float,
+                     gt_vocabulary: bool = False) -> tuple[str, dict]:
     """Extract dominant color for a track's bounding box crop.
 
     For very small crops (< 8px in either dimension), the crop is upscaled to
@@ -134,7 +169,7 @@ def _get_track_color(frame_bgr: np.ndarray, x: float, y: float,
         scale = max(16 / ch, 16 / cw)
         crop = cv2.resize(crop, (max(16, int(cw * scale)), max(16, int(ch * scale))),
                           interpolation=cv2.INTER_NEAREST)
-    return _dominant_color_from_crop(crop)
+    return _dominant_color_from_crop(crop, gt_vocabulary=gt_vocabulary)
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +209,11 @@ class SceneGraphBuilder:
     OVERLAP_THRESH = 0.05   # IoU ≥ this → "overlapping"
     CLIP_SIM_THRESH = 0.85  # cosine sim ≥ this → "visually-similar"
 
-    def __init__(self, text_prompt: str = ""):
+    def __init__(self, text_prompt: str = "", gt_vocabulary: bool = False):
         self.text_prompt = text_prompt
+        # Name colours in the benchmark's vocabulary rather than the default
+        # LAB labels.  Off by default: the offline eval path keeps its bins.
+        self.gt_vocabulary = bool(gt_vocabulary)
         self.frames: List[Dict[str, Any]] = []
         # Track motion history: track_id -> deque[(cx_norm, cy_norm, area_norm)]
         self._history: Dict[int, deque] = {}
@@ -330,7 +368,8 @@ class SceneGraphBuilder:
         }
 
         if frame_bgr is not None:
-            color, votes = _get_track_color(frame_bgr, x, y, w, h)
+            color, votes = _get_track_color(
+                frame_bgr, x, y, w, h, gt_vocabulary=self.gt_vocabulary)
             node["color"]        = color
             node["color_votes"]  = votes
 
@@ -522,6 +561,20 @@ class SceneGraphMissionFilter:
     # Public API
     # ------------------------------------------------------------------
 
+    def score_tracks(self, frame_graph: Dict[str, Any]) -> Dict[int, float]:
+        """Return {track_id: mission score} for this frame's scene graph.
+
+        Accumulates colour evidence as a side effect, so call it once per
+        frame.  decide() is this plus a threshold; the ROS2 perception path
+        wants the scores themselves, for Perception.match_prob.
+        """
+        scores: Dict[int, float] = {}
+        for node in frame_graph.get("nodes", []):
+            tid = node["track_id"]
+            self._accumulate_color(tid, node.get("color_votes", {}))
+            scores[tid] = self._score_node(node, tid)
+        return scores
+
     def decide(self, frame_graph: Dict[str, Any]) -> set:
         """
         Return set of track_ids to keep from this frame's scene graph.
@@ -529,18 +582,9 @@ class SceneGraphMissionFilter:
         Args:
             frame_graph: dict returned by SceneGraphBuilder.update()
         """
-        kept = set()
-        for node in frame_graph.get("nodes", []):
-            tid = node["track_id"]
-            self._accumulate_color(tid, node.get("color_votes", {}))
-            score = self._score_node(node, tid)
-            if self.hard_mode:
-                if score >= 1.0:
-                    kept.add(tid)
-            else:
-                if score >= self.score_thresh:
-                    kept.add(tid)
-        return kept
+        threshold = 1.0 if self.hard_mode else self.score_thresh
+        return {tid for tid, score in self.score_tracks(frame_graph).items()
+                if score >= threshold}
 
     def get_track_color_evidence(self, track_id: int) -> Dict[str, Any]:
         """Return accumulated color vote stats for a track (for debugging)."""
