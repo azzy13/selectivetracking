@@ -95,6 +95,51 @@ docker exec gd_demo /app/GroundingDINO/docker/run_demo.sh --seconds 30
 docker rm -f gd_demo
 ```
 
+#### Frame rate, and why it decides your ID switches
+
+`--fps` sets the publish rate, the timestamp spacing, the video writer's rate,
+**and** ByteTrack's `frame_rate`. Default 30; `--fps auto` reads the rate out of
+the file. Set it per video to whatever that video was recorded at.
+
+It feeds ByteTrack because `tracker/byte_tracker.py:149` computes
+
+```python
+max_time_lost = int(frame_rate / 30.0 * track_buffer)
+```
+
+so a track is dropped after that many missed frames. With the node's old
+default (`frame_rate=10`, `track_buffer=30`) that is 10 frames — a sixth of a
+second at 60 fps, so any brief miss returns a new id.
+
+The bigger cause of id churn is dropped frames. The node's image subscription
+has queue depth 1, so anything it cannot keep up with is discarded. On
+`carla1.mp4` (2560x1400) it sustains about **7 fps**, measured:
+
+| publish rate | processed / 2071 | dropped |
+|---|---|---|
+| 30 fps | 496 | 76% |
+| 60 fps | 271 | 87% |
+| `--lockstep` | 2071 | 0% |
+
+Publishing faster does not track faster — it just drops more, and the frames
+that do get through are further apart, which is exactly when IoU association
+fails. **For offline processing of a recording, use `--lockstep`:** the stub
+waits for the node before sending each frame, so every frame is processed and
+the timestamps still advance at the true rate. It runs slower than real time
+(~5 min for carla1) and that is fine, because the sim clock is synthetic.
+
+```bash
+docker exec gd_demo /app/GroundingDINO/docker/run_demo.sh \
+  --full --lockstep --video videos/carla1.mp4 --fps 60 --track-buffer 90
+```
+
+`--full` plays the video once and stops, instead of looping for `--seconds`.
+
+The script refuses to start if another `groundingdino_node` is on the same
+`ROS_DOMAIN_ID`. Containers sharing `--ipc=host` discover each other over
+shared memory even without a shared network, and the recorder would silently
+mix their output together.
+
 Everything lands in `outputs/demo/` on the host:
 
 | File | Written by | Contents |
