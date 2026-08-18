@@ -23,6 +23,11 @@ from typing import List, Optional, Dict, Any
 import cv2
 import numpy as np
 
+# Single-source the role vocabulary from the grounding layer so a node's role
+# string can never drift from the one the scorer checks.  query_grounding
+# deliberately imports nothing from here, so this stays acyclic.
+from query_grounding import ROLE_ANCHOR, ROLE_TARGET
+
 
 # ---------------------------------------------------------------------------
 # LAB color classifier
@@ -186,20 +191,29 @@ class SceneGraphBuilder:
         img_h: int,
         img_w: int,
         frame_bgr: Optional[np.ndarray] = None,
+        roles: Optional[Dict[int, str]] = None,
     ) -> Dict[str, Any]:
         """
         Build scene graph for one frame.
+
+        The graph is built over ALL candidates handed to it — target candidates
+        and anchors alike — before anything is filtered or scored.  That is the
+        point: an anchor that never becomes a node can never be related to.
 
         Args:
             frame_id:  integer frame index
             tracks:    list of STrack objects (ByteTrack or CLIPTracker)
             img_h/w:   original image dimensions
             frame_bgr: optional BGR frame for color extraction
+            roles:     optional {track_id: 'target_candidate' | 'anchor'} from
+                       ``query_grounding.assign_track_roles``.  Omitted (the
+                       default) means every node is a target candidate, which is
+                       the pre-Week-3 behaviour.
 
         Returns:
             dict with keys: frame_id, prompt, nodes, edges
         """
-        nodes = [self._build_node(t, img_h, img_w, frame_bgr) for t in tracks]
+        nodes = [self._build_node(t, img_h, img_w, frame_bgr, roles) for t in tracks]
 
         # Update motion history before computing motion relations
         for n in nodes:
@@ -216,22 +230,31 @@ class SceneGraphBuilder:
             n["heading_vec"]  = motion_attrs["heading_vec"]
             n["heading_deg"]  = motion_attrs["heading_deg"]
 
-        # Pairwise edges
+        # Pairwise edges.  An edge with no relation labels is normally pruned,
+        # but an anchor is required to have an edge to every target candidate —
+        # "no relation held this frame" is itself information the scorer needs,
+        # and a missing edge is indistinguishable from a missing node.
         edges = []
         for i in range(len(nodes)):
             for j in range(i + 1, len(nodes)):
                 rels = self._compute_relations(nodes[i], nodes[j], tracks[i], tracks[j])
-                if rels:
+                spans_anchor = (
+                    nodes[i]["role"] == ROLE_ANCHOR or nodes[j]["role"] == ROLE_ANCHOR
+                )
+                if rels or spans_anchor:
                     edges.append({
                         "source": nodes[i]["track_id"],
                         "target": nodes[j]["track_id"],
                         "relations": rels,
                     })
 
+        n_anchor = sum(1 for n in nodes if n["role"] == ROLE_ANCHOR)
         frame_graph = {
             "frame_id": frame_id,
             "prompt": self.text_prompt,
             "num_tracks": len(nodes),
+            "num_target_candidates": len(nodes) - n_anchor,
+            "num_anchors": n_anchor,
             "nodes": nodes,
             "edges": edges,
         }
@@ -253,11 +276,14 @@ class SceneGraphBuilder:
             return {"total_frames": 0}
         total_nodes = sum(fg["num_tracks"] for fg in self.frames)
         total_edges = sum(len(fg["edges"]) for fg in self.frames)
+        total_anchors = sum(fg.get("num_anchors", 0) for fg in self.frames)
         n = len(self.frames)
         return {
             "total_frames": n,
             "avg_nodes_per_frame": round(total_nodes / n, 2),
             "avg_edges_per_frame": round(total_edges / n, 2),
+            "avg_anchor_nodes_per_frame": round(total_anchors / n, 2),
+            "frames_with_anchor": sum(1 for fg in self.frames if fg.get("num_anchors", 0)),
             "total_unique_tracks": len(self._history),
         }
 
@@ -271,6 +297,7 @@ class SceneGraphBuilder:
         img_h: int,
         img_w: int,
         frame_bgr: Optional[np.ndarray],
+        roles: Optional[Dict[int, str]] = None,
     ) -> Dict[str, Any]:
         x, y, w, h = track.tlwh
         cx = x + w / 2.0
@@ -284,6 +311,9 @@ class SceneGraphBuilder:
 
         node: Dict[str, Any] = {
             "track_id":    int(track.track_id),
+            # 'target_candidate' unless grounding says otherwise.  Anchors are
+            # graph scaffolding: they are scored against, never emitted.
+            "role":        (roles or {}).get(int(track.track_id), ROLE_TARGET),
             "bbox_tlwh":   [round(float(v), 1) for v in (x, y, w, h)],
             "cx_norm":     round(cx_norm, 4),
             "cy_norm":     round(cy_norm, 4),

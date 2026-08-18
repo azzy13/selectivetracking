@@ -3,7 +3,8 @@
 GroundingDINO ROS2 Node - Wraps Worker class for detection and tracking.
 
 This node subscribes to camera images, runs GroundingDINO detection with ByteTrack/CLIP tracking,
-and publishes tracking results as custom ROS2 messages.
+and publishes tracking results as Trinity messages for plug-and-play compatibility with other
+SRI perception models.
 """
 
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from std_msgs.msg import String, Header
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -22,7 +23,7 @@ GROUNDINGDINO_ROOT = Path(__file__).parent.parent.parent.parent.parent
 sys.path.insert(0, str(GROUNDINGDINO_ROOT))
 
 from worker_simple import Worker
-from groundingdino_ros.msg import GroundingDINOTrack, GroundingDINOTrackArray
+from trinity_msgs.msg import Detection, DetectionArray, Perception, PerceptionArray
 
 # Import mission parser (same directory when installed)
 try:
@@ -63,10 +64,16 @@ class GroundingDINONode(Node):
         )
         self.get_logger().info(f"Subscribed to: {camera_topic}")
 
-        # Publishers
-        self.tracks_pub = self.create_publisher(
-            GroundingDINOTrackArray,
-            '/groundingdino/tracks',
+        # Publishers (Trinity messages for plug-and-play compatibility)
+        self.detections_pub = self.create_publisher(
+            DetectionArray,
+            self.get_parameter('detections_topic').value,
+            10
+        )
+
+        self.perceptions_pub = self.create_publisher(
+            PerceptionArray,
+            self.get_parameter('perceptions_topic').value,
             10
         )
 
@@ -118,6 +125,10 @@ class GroundingDINONode(Node):
         self.declare_parameter('camera_topic', '/viaduct/Sim/SceneDroneSensors/robots/Drone1/sensors/front_center1/scene_camera/image')
         self.declare_parameter('mission_config_path', '/mission_briefing/config.json')
         self.declare_parameter('output_visualization', True)
+
+        # Output topic names (Trinity messages)
+        self.declare_parameter('detections_topic', '/perception/detections')
+        self.declare_parameter('perceptions_topic', '/perception/perceptions')
 
         # Text prompts
         self.declare_parameter('default_classes', ['car', 'pedestrian'])
@@ -214,8 +225,9 @@ class GroundingDINONode(Node):
                 self._publish_visualization(frame, tracks, msg.header)
 
             # Publish debug info
+            active_tracks = sum(1 for t in tracks if t.is_activated)
             debug_msg = String()
-            debug_msg.data = f"Frame {self.frame_id}: {len(dets_xyxy)} detections, {len(tracks)} tracks"
+            debug_msg.data = f"Frame {self.frame_id}: {len(dets_xyxy)} detections, {active_tracks} active tracks"
             self.debug_pub.publish(debug_msg)
 
             self.frame_id += 1
@@ -224,48 +236,63 @@ class GroundingDINONode(Node):
             self.get_logger().error(f"Error processing frame: {e}", throttle_duration_sec=1.0)
 
     def _publish_tracks(self, tracks, header, img_h: int, img_w: int):
-        """Publish tracking results as ROS2 message."""
+        """Publish tracking results as Trinity ROS2 messages."""
 
-        track_array_msg = GroundingDINOTrackArray()
-        track_array_msg.header = header
-        track_array_msg.frame_id = self.frame_id
-        track_array_msg.text_prompt = self.text_prompt
-        track_array_msg.tracker_type = self.worker.tracker_type
+        frame_num = self.frame_id % 65536  # uint16 wrap
+
+        det_array_msg = DetectionArray()
+        det_array_msg.image_header = header
+        det_array_msg.pointcloud_header = Header()
+
+        perc_array_msg = PerceptionArray()
+        perc_array_msg.stamp = self.get_clock().now().to_msg()
+        perc_array_msg.frame_num = frame_num
 
         for track in tracks:
             if not track.is_activated:
                 continue
 
-            track_msg = GroundingDINOTrack()
-            track_msg.header = header
-
-            # Track info
-            track_msg.track_id = int(track.track_id)
-            track_msg.frame_id = self.frame_id
-            track_msg.class_name = "object"  # TODO: extract from phrases if available
-            track_msg.confidence = float(track.score)
-
-            # Bounding box in pixels (tlwh format)
             tlwh = track.tlwh
-            track_msg.x = float(tlwh[0])
-            track_msg.y = float(tlwh[1])
-            track_msg.width = float(tlwh[2])
-            track_msg.height = float(tlwh[3])
+            x1 = int(max(0, tlwh[0]))
+            y1 = int(max(0, tlwh[1]))
+            x2 = int(min(img_w, tlwh[0] + tlwh[2]))
+            y2 = int(min(img_h, tlwh[1] + tlwh[3]))
+            cx_norm = float((tlwh[0] + tlwh[2] / 2) / img_w)
+            cy_norm = float((tlwh[1] + tlwh[3] / 2) / img_h)
+            score = float(track.score)
+            track_id = int(track.track_id)
 
-            # Bounding box in normalized coordinates
-            track_msg.cx_norm = float((tlwh[0] + tlwh[2] / 2) / img_w)
-            track_msg.cy_norm = float((tlwh[1] + tlwh[3] / 2) / img_h)
-            track_msg.width_norm = float(tlwh[2] / img_w)
-            track_msg.height_norm = float(tlwh[3] / img_h)
+            det_msg = Detection()
+            det_msg.frame_number = frame_num
+            det_msg.detection_model = "groundingdino"
+            det_msg.detection_prob = score
+            det_msg.bounding_box = [x1, y1, x2, y2]
+            det_msg.center_world_coords = [cx_norm, cy_norm, 0.0]
+            det_msg.car_type_names = ["object"]
+            det_msg.car_type_probs = [score]
+            det_msg.color_names = []
+            det_msg.color_probs = []
+            det_msg.occlusion_level = 0
+            det_msg.occlusion_label = ""
+            det_msg.pose_idx = 0
+            det_msg.pose_label = ""
+            det_array_msg.detections.append(det_msg)
 
-            # Track status
-            track_msg.is_activated = bool(track.is_activated)
-            track_msg.tracklet_len = int(track.tracklet_len)
+            perc_msg = Perception()
+            perc_msg.tracking_id = track_id % 65536
+            perc_msg.target_entity_id = str(track_id)
+            perc_msg.detection_prob = score
+            perc_msg.location = [cx_norm, cy_norm, 0.0]
+            perc_msg.yaw = 0.0
+            perc_msg.entity_class = "object"
+            perc_msg.entity_color = ""
+            perc_msg.occlusion = ""
+            perc_msg.pose = ""
+            perc_msg.match_prob = score
+            perc_array_msg.perceptions.append(perc_msg)
 
-            track_array_msg.tracks.append(track_msg)
-
-        track_array_msg.total_tracks = len(track_array_msg.tracks)
-        self.tracks_pub.publish(track_array_msg)
+        self.detections_pub.publish(det_array_msg)
+        self.perceptions_pub.publish(perc_array_msg)
 
     def _publish_visualization(self, frame, tracks, header):
         """Publish annotated image with bounding boxes."""

@@ -31,6 +31,7 @@ import pandas as pd
 
 from groundingdino.util.inference import load_model, predict
 from demo.florence2_adapter import Florence2Detector
+from query_grounding import ROLE_TARGET
 
 # ============================
 # Configuration Defaults
@@ -769,6 +770,9 @@ class Worker:
         referring_thresh: float = 0.25,
         use_spatial_filter: bool = True,
         use_color_filter: bool = True,
+        # Query grounding (Week 3) — see query_grounding.py
+        query=None,                          # a query_parser.Query, or None
+        debug_draw_anchors: bool = False,    # dotted anchor boxes in debug video
         # Scale-aware detection
         use_scale_aware_thresh: bool = True,
         small_box_area_thresh: int = 5000,
@@ -782,6 +786,20 @@ class Worker:
         referkitti_data_root: Optional[str] = None,  # Path to ReferKITTI root (for GT labels)
         target_object_ids: Optional[List[int]] = None,  # For referring expressions - which object IDs to show as GT
     ):
+        # --- query grounding ------------------------------------------------
+        # With a parsed Query, the caption is built from target AND anchor
+        # classes, the scene graph is built over everything detected, and the
+        # hard filters are replaced by the soft subgraph scorer.  Without one,
+        # every path below behaves exactly as it did before Week 3.
+        self.query = query
+        self.grounding_enabled = query is not None
+        self.debug_draw_anchors = bool(debug_draw_anchors)
+        self._track_roles: Dict[int, str] = {}   # role memory across frames
+        if self.grounding_enabled:
+            from query_grounding import build_detector_prompt, describe_grounding
+            text_prompt = build_detector_prompt(query, dotted=True)
+            print(f"[Worker] Query grounding: {describe_grounding(query)}")
+
         self.text_prompt = text_prompt
         self.box_thresh = float(box_thresh)
         self.text_thresh = float(text_thresh)
@@ -848,9 +866,14 @@ class Worker:
                     self.clip_model.encode_text(tokens).float(), dim=-1
                 ).contiguous()
 
-        # Referring filter
+        # Referring filter.  Query grounding replaces it: the hard filter is
+        # exactly what removed the anchor before the graph was built, so it is
+        # not merely bypassed but never constructed.
         self.referring_filter = None
-        if referring_mode != "none" and self.clip_model is not None:
+        if self.grounding_enabled and referring_mode != "none":
+            print("[Worker] Referring filter disabled — query grounding scores "
+                  "all candidates instead of filtering them")
+        if referring_mode != "none" and self.clip_model is not None and not self.grounding_enabled:
             self.referring_filter = ReferringDetectionFilter(
                 clip_model=self.clip_model,
                 clip_preprocess=self.clip_preprocess,
@@ -928,18 +951,15 @@ class Worker:
                 box_threshold=self.box_thresh
             )
 
-    def _apply_scale_aware_filtering(self, dets_xyxy: np.ndarray, img_w: int = 0, img_h: int = 0) -> np.ndarray:
-        """
-        Apply scale-aware thresholding: lower threshold for small/distant objects.
+    def _scale_aware_keep_mask(self, dets_xyxy: np.ndarray) -> np.ndarray:
+        """Boolean keep-mask for scale-aware thresholding.
 
-        Small boxes (distant objects) are harder to detect and get lower scores,
-        so we use a more lenient threshold for them.
+        Split out from _apply_scale_aware_filtering so the query-grounding path
+        can apply the same mask to its parallel per-detection role list and keep
+        the two aligned.
         """
-        if dets_xyxy.size == 0:
-            return dets_xyxy
-
-        kept = []
-        for det in dets_xyxy:
+        keep = np.zeros(len(dets_xyxy), dtype=bool)
+        for i, det in enumerate(dets_xyxy):
             x1, y1, x2, y2, score = det
             box_area = (x2 - x1) * (y2 - y1)
 
@@ -956,11 +976,68 @@ class Worker:
                 # Large box: use full threshold
                 adaptive_thresh = self.box_thresh
 
-            # Keep detection if score >= adaptive threshold
-            if score >= adaptive_thresh:
-                kept.append(det)
+            keep[i] = score >= adaptive_thresh
+        return keep
 
-        return np.array(kept, dtype=np.float32).reshape(-1, 5) if kept else np.empty((0, 5), dtype=np.float32)
+    def _apply_scale_aware_filtering(self, dets_xyxy: np.ndarray, img_w: int = 0, img_h: int = 0) -> np.ndarray:
+        """
+        Apply scale-aware thresholding: lower threshold for small/distant objects.
+
+        Small boxes (distant objects) are harder to detect and get lower scores,
+        so we use a more lenient threshold for them.
+        """
+        if dets_xyxy.size == 0:
+            return dets_xyxy
+
+        kept = dets_xyxy[self._scale_aware_keep_mask(dets_xyxy)]
+        return kept.astype(np.float32).reshape(-1, 5) if len(kept) else np.empty((0, 5), dtype=np.float32)
+
+    def predict_detections_with_roles(self, frame_bgr: np.ndarray, tensor_image: Optional[torch.Tensor],
+                                      orig_h: int, orig_w: int):
+        """Detect with the query caption and tag each detection with its role.
+
+        Same detector call as predict_detections, but the grounded phrases are
+        kept instead of discarded: with a "target . anchor" caption, the phrase a
+        box grounded to is what says whether the box is a target candidate or the
+        anchor (see query_grounding.assign_detection_roles).
+
+        remove_combined=True keeps each phrase inside one caption segment, so a
+        box cannot come back as "red car bus" and be unassignable.
+
+        Returns:
+            (dets_xyxy, roles) — an (N, 5) array and an aligned list of N roles.
+        """
+        from query_grounding import assign_detection_roles
+
+        if self.detector_kind != "dino":
+            # Florence returns no phrases; every detection is a target candidate.
+            dets = self.predict_detections(frame_bgr, tensor_image, orig_h, orig_w)
+            return dets, [ROLE_TARGET] * len(dets)
+
+        initial_box_thresh = self.box_thresh * 0.5 if self.use_scale_aware_thresh else self.box_thresh
+
+        with torch.no_grad(), autocast(enabled=self.use_fp16):
+            boxes, logits, phrases = predict(
+                model=self.dino_model,
+                image=tensor_image,
+                caption=self.text_prompt,
+                box_threshold=initial_box_thresh,
+                text_threshold=self.text_thresh,
+                remove_combined=True,
+            )
+
+        # convert_dino_to_xyxy drops degenerate boxes, so rebuild the phrase list
+        # against the rows that survived rather than assuming a 1:1 mapping.
+        keep_idx = [i for i, box in enumerate(boxes) if box[2] > 0 and box[3] > 0]
+        dets = convert_dino_to_xyxy(boxes, logits, orig_w, orig_h)
+        phrases = [phrases[i] for i in keep_idx]
+
+        if self.use_scale_aware_thresh and dets.size > 0:
+            mask = self._scale_aware_keep_mask(dets)
+            dets = dets[mask].astype(np.float32).reshape(-1, 5)
+            phrases = [p for p, k in zip(phrases, mask) if k]
+
+        return dets, assign_detection_roles(phrases, self.query)
 
     def update_tracker(self, dets_xyxy: np.ndarray, orig_h: int, orig_w: int):
         """Update tracker with detections."""
@@ -1104,11 +1181,16 @@ class Worker:
 
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-        # Scene graph builder (optional)
+        # Scene graph builder.  Query grounding needs it unconditionally — the
+        # graph is what the candidates are scored over, not an optional export.
         sg_builder = None
-        if enable_scene_graph:
+        if enable_scene_graph or self.grounding_enabled:
             from scene_graph import SceneGraphBuilder
             sg_builder = SceneGraphBuilder(text_prompt=self.text_prompt)
+        if self.grounding_enabled:
+            from query_grounding import (anchor_tracks, assign_track_roles,
+                                         draw_dotted_rect, emitted_tracks,
+                                         score_candidates)
 
         with open(out_path, "w") as f_res:
             for idx, frame_name in enumerate(frame_files):
@@ -1132,9 +1214,14 @@ class Worker:
                     if idx == 0:
                         print(f"[{seq}] F{frame_id}: {orig_h}x{orig_w} | {type(self.tracker).__name__} | {self.detector_kind}")
 
-                # Detect
-                dets = self.predict_detections(img, tensor, orig_h, orig_w)
+                # Detect.  Grounded: caption carries target + anchor classes and
+                # each detection comes back tagged with its role.
                 show_detail = (idx % 20 == 0)
+                det_roles = None
+                if self.grounding_enabled:
+                    dets, det_roles = self.predict_detections_with_roles(img, tensor, orig_h, orig_w)
+                else:
+                    dets = self.predict_detections(img, tensor, orig_h, orig_w)
                 if show_detail:
                     print(f"[{seq}] F{frame_id}: det={len(dets)}", end="")
 
@@ -1160,15 +1247,37 @@ class Worker:
                     if show_detail:
                         print(f" → color={len(tracks)}", end="")
 
+                # Roles: detection -> track, so the graph knows what each node is.
+                track_roles = None
+                if self.grounding_enabled:
+                    track_roles = assign_track_roles(tracks, dets, det_roles,
+                                                     sticky=self._track_roles)
+
+                # Scene graph over ALL candidates — anchors included — before
+                # anything is scored or discarded.
+                frame_graph = None
+                if sg_builder is not None:
+                    frame_graph = sg_builder.update(frame_id, tracks, orig_h, orig_w,
+                                                    frame_bgr=img, roles=track_roles)
+
+                # Score every target candidate against the query subgraph.  This
+                # replaces the hard filter; nothing is dropped by scoring.
+                if self.grounding_enabled and frame_graph is not None:
+                    weights = score_candidates(frame_graph, self.query)
+                    out_tracks = emitted_tracks(tracks, track_roles)
+                    if show_detail:
+                        print(f" → cand={len(out_tracks)} "
+                              f"anchor={frame_graph['num_anchors']} "
+                              f"scored={len(weights)}", end="")
+                else:
+                    out_tracks = tracks
+
                 if show_detail:
                     print()
 
-                # Scene graph update
-                if sg_builder is not None:
-                    sg_builder.update(frame_id, tracks, orig_h, orig_w, frame_bgr=img)
-
-                # Write results
-                for t in tracks:
+                # Write results.  out_tracks is target candidates only — anchors
+                # never reach any output path.
+                for t in out_tracks:
                     x, y, w, h = t.tlwh
                     if w * h > self.min_box_area:
                         self._write_mot_line(f_res, frame_id, t.track_id, float(x), float(y), float(w), float(h))
@@ -1177,8 +1286,9 @@ class Worker:
                 if self.save_video and video_writer is not None:
                     vis_frame = img.copy()
 
-                    # Draw predicted tracks (green)
-                    for t in tracks:
+                    # Draw predicted tracks (green, solid).  Target candidates
+                    # only — same list that gets written out.
+                    for t in out_tracks:
                         x, y, w, h = t.tlwh
                         if w * h > self.min_box_area:
                             x1, y1 = int(x), int(y)
@@ -1186,6 +1296,18 @@ class Worker:
                             cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                             cv2.putText(vis_frame, f"ID:{t.track_id}", (x1, y1 - 5),
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                    # Debug only: anchors, dotted and unlabelled (they have no
+                    # output identity).  Off unless debug_draw_anchors is set.
+                    if self.grounding_enabled and self.debug_draw_anchors:
+                        from query_grounding import ANCHOR_DEBUG_COLOR
+                        for t in anchor_tracks(tracks, track_roles):
+                            x, y, w, h = t.tlwh
+                            draw_dotted_rect(vis_frame, (x, y), (x + w, y + h),
+                                             ANCHOR_DEBUG_COLOR, thickness=2)
+                            cv2.putText(vis_frame, "anchor", (int(x), int(y) - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                        ANCHOR_DEBUG_COLOR, 1)
 
                     # Draw GT boxes if enabled
                     if self.show_gt_boxes:
@@ -1222,6 +1344,11 @@ class Worker:
             print(f"[{seq}] Scene graph: {summary['total_frames']} frames, "
                   f"avg {summary['avg_nodes_per_frame']} nodes, "
                   f"avg {summary['avg_edges_per_frame']} edges/frame")
+            if self.grounding_enabled:
+                print(f"[{seq}] Anchor nodes: "
+                      f"{summary['frames_with_anchor']}/{summary['total_frames']} frames "
+                      f"({summary['avg_anchor_nodes_per_frame']} avg/frame) — "
+                      f"graph scaffolding, not emitted")
 
         if video_writer is not None:
             video_writer.release()
