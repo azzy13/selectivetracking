@@ -159,3 +159,6 @@ dump/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Staging dir created by docker/build_ros2.sh (removed on exit)
+_trinity_msgs_build/
