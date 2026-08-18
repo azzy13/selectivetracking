@@ -32,6 +32,21 @@ except ModuleNotFoundError:
     from mission_parser import get_text_prompt_from_mission
 
 
+def _set_if_present(msg, field: str, value) -> bool:
+    """Assign msg.field only if this trinity_msgs build actually defines it.
+
+    We build against the trinity_msgs revision the running stack pins (0.22),
+    but the repo HEAD (0.58) has extra fields.  rosidl message classes use
+    __slots__, so assigning a field that does not exist in the built revision
+    raises AttributeError and kills the frame.  This keeps one node source
+    working against both revisions.
+    """
+    if hasattr(msg, field):
+        setattr(msg, field, value)
+        return True
+    return False
+
+
 class GroundingDINONode(Node):
     """ROS2 node for GroundingDINO detection and tracking."""
 
@@ -272,10 +287,11 @@ class GroundingDINONode(Node):
             det_msg.car_type_probs = [score]
             det_msg.color_names = []
             det_msg.color_probs = []
-            det_msg.occlusion_level = 0
-            det_msg.occlusion_label = ""
-            det_msg.pose_idx = 0
-            det_msg.pose_label = ""
+            # 0.58-only fields; absent from the pinned 0.22 the stack runs
+            _set_if_present(det_msg, "occlusion_level", 0)
+            _set_if_present(det_msg, "occlusion_label", "")
+            _set_if_present(det_msg, "pose_idx", 0)
+            _set_if_present(det_msg, "pose_label", "")
             det_array_msg.detections.append(det_msg)
 
             perc_msg = Perception()
@@ -286,8 +302,9 @@ class GroundingDINONode(Node):
             perc_msg.yaw = 0.0
             perc_msg.entity_class = "object"
             perc_msg.entity_color = ""
-            perc_msg.occlusion = ""
-            perc_msg.pose = ""
+            # 0.58-only fields; absent from the pinned 0.22 the stack runs
+            _set_if_present(perc_msg, "occlusion", "")
+            _set_if_present(perc_msg, "pose", "")
             perc_msg.match_prob = score
             perc_array_msg.perceptions.append(perc_msg)
 
