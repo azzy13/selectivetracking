@@ -65,6 +65,7 @@ docker run --rm --gpus all --ipc=host \
     -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
     -v "$PROJECT_ROOT/weights:/weights:ro" \
     -v "$PROJECT_ROOT/videos:/app/GroundingDINO/videos:ro" \
+    -v "$PROJECT_ROOT/ros2_package:/app/GroundingDINO/ros2_package:ro" \
     -v "$BRIEFING:/mission_briefing:ro" \
     "$IMAGE" \
     bash -c "
@@ -105,6 +106,9 @@ python3 ros2_package/sim_stub_publisher.py \
     > /tmp/stub.log 2>&1 &
 STUB_PID=\$!
 sleep 20
+if ! kill -0 \$STUB_PID 2>/dev/null; then
+    echo 'STUB DIED:'; tail -30 /tmp/stub.log; exit 1
+fi
 
 echo ''
 echo '=============================================='
@@ -112,7 +116,11 @@ echo 'PerceptionArray on /vanderbilt/fake_perception/data'
 echo '=============================================='
 timeout 60 ros2 topic echo --once --full-length \
     /vanderbilt/fake_perception/data || {
-        echo 'NO MESSAGE RECEIVED'; tail -40 /tmp/node.log; exit 1; }
+        echo 'NO MESSAGE RECEIVED'
+        echo '--- node log ---';  tail -40 /tmp/node.log
+        echo '--- stub log ---';  tail -20 /tmp/stub.log
+        echo '--- topics ---';    ros2 topic list
+        exit 1; }
 
 echo ''
 echo '--- node log (projection path, entities) ---'
