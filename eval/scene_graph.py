@@ -209,11 +209,16 @@ class SceneGraphBuilder:
     OVERLAP_THRESH = 0.05   # IoU ≥ this → "overlapping"
     CLIP_SIM_THRESH = 0.85  # cosine sim ≥ this → "visually-similar"
 
-    def __init__(self, text_prompt: str = "", gt_vocabulary: bool = False):
+    def __init__(self, text_prompt: str = "", gt_vocabulary: bool = False,
+                 max_frames: Optional[int] = None):
         self.text_prompt = text_prompt
         # Name colours in the benchmark's vocabulary rather than the default
         # LAB labels.  Off by default: the offline eval path keeps its bins.
         self.gt_vocabulary = bool(gt_vocabulary)
+        # Retain only the last max_frames graphs.  None (the default) keeps
+        # every frame, which is what save_jsonl() needs offline; a live node
+        # sets a cap so a long mission does not grow without bound.
+        self.max_frames = max_frames
         self.frames: List[Dict[str, Any]] = []
         # Track motion history: track_id -> deque[(cx_norm, cy_norm, area_norm)]
         self._history: Dict[int, deque] = {}
@@ -297,6 +302,8 @@ class SceneGraphBuilder:
             "edges": edges,
         }
         self.frames.append(frame_graph)
+        if self.max_frames is not None and len(self.frames) > self.max_frames:
+            del self.frames[:-self.max_frames]
         return frame_graph
 
     def save_jsonl(self, path: str):
