@@ -69,6 +69,49 @@ Runs the pipeline on `videos/color_car.mp4` against a stub AirSim publisher
 frames from a synthetic clock starting at t=1000s, so a sim-clock stamp is
 visibly distinguishable from a wall-clock one.
 
+### Save the results to disk
+
+Start the container once, then run the demo script inside it:
+
+```bash
+mkdir -p outputs/demo /tmp/briefing
+cat > /tmp/briefing/config.json <<'JSON'
+{"entities_of_interest": [
+  {"entity_id": "Car495", "entity_type": "Car",
+   "attributes": {"color": "black", "class": "SEDAN.1"}}]}
+JSON
+
+docker run -d --name gd_demo --gpus all --ipc=host \
+  -e ROS_DOMAIN_ID=0 -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) \
+  -v "$PWD/weights:/weights:ro" \
+  -v "$PWD/videos:/app/GroundingDINO/videos:ro" \
+  -v "$PWD/ros2_package:/app/GroundingDINO/ros2_package:ro" \
+  -v "$PWD/docker:/app/GroundingDINO/docker:ro" \
+  -v /tmp/briefing:/mission_briefing:ro \
+  -v "$PWD/outputs/demo:/output:rw" \
+  --entrypoint sleep groundingdino_ros:latest infinity
+
+docker exec gd_demo /app/GroundingDINO/docker/run_demo.sh --seconds 30
+docker rm -f gd_demo
+```
+
+Everything lands in `outputs/demo/` on the host:
+
+| File | Written by | Contents |
+|---|---|---|
+| `tracked.avi` | `video_saver.py` | annotated video, boxes + track ids |
+| `perceptions.jsonl` | `perception_recorder.py` | one JSON object per `PerceptionArray` |
+| `perceptions.csv` | `perception_recorder.py` | one row per perception |
+| `node.log` | the node | projection path, prompt, entities |
+| `stub.log`, `saver.log`, `recorder.log` | helpers | |
+
+`HOST_UID`/`HOST_GID` hand the files back to you; the container runs as root,
+so without them everything in `/output` is root-owned.
+
+The node itself has **no disk-output flag** — it only publishes ROS topics.
+`video_saver.py` and `perception_recorder.py` are separate subscriber nodes,
+which is why the demo script starts four processes rather than one.
+
 ---
 
 ## The topic
