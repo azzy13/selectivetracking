@@ -15,6 +15,7 @@ version = "0.1.0"
 description = "Selective multi-object tracking with open-vocabulary detection"
 authors = [
     {name = "Di Yao", email = "di.yao@vanderbilt.edu"},
+    {name = "Azhar Hasan", email = "azhar.hasan@vanderbilt.edu"},
 ]
 license = {file = "LICENSE"}
 readme = "README.md"
@@ -34,6 +35,53 @@ requires-python = ">=3.10"
 #     library in one environment.
 dependencies = []
 
+[project.optional-dependencies]
+# The pip path, for environments that have no conda: `docker/Dockerfile.ros2`,
+# which builds on a ROS 2 Humble image whose rclpy and cv_bridge come from apt
+# and are bound to the system interpreter, so a pixi environment cannot be
+# swapped in underneath them.
+#
+# This is the former `requirements.txt`, moved here so the project states its
+# dependencies in one file rather than two that drift.  It stays a *separate*
+# list from [tool.pixi.dependencies] rather than a generated view of it, because
+# the two ecosystems disagree on names and on what exists at all:
+#
+#     conda            pip
+#     pytorch          torch
+#     opencv           opencv-python
+#     groundingdino-py  -- 0.4.1 is not on PyPI; the Dockerfile builds it from
+#                          git instead, which is why it is absent below
+#
+# pixi does not resolve this table.  Extras reach an editable path dependency
+# only when it asks for them by name, and [tool.pixi.pypi-dependencies] requests
+# `selectivetracking` with no `extras`, so the duplicate-resolution problem
+# described above stays solved.
+docker = [
+    "torch<=2.1.2",
+    "torchvision",
+    "numpy==1.26.2",
+    # Vestigial: this pinned setuptools so the old setup.py could build the
+    # vendored CUDA extension under `--no-build-isolation`.  There is no such
+    # build any more, but pip on the ROS image does not guarantee setuptools,
+    # and dropping a pin is a change to make deliberately rather than in passing.
+    "setuptools==78.1.1",
+    "transformers==4.49.0",
+    "supervision>=0.22.0",
+    "opencv-python",
+    "timm",
+    "accelerate",
+    "einops",
+    "addict",
+    "yapf",
+    "pycocotools",
+    "cython_bbox",
+    "lap",
+    "clip",
+    "pandas",
+    "motmetrics",
+    "ipykernel",
+]
+
 [tool.hatch.build.targets.wheel]
 # `groundingdino/` is deliberately absent.  What survives there is two model
 # config files, read by path at run time, belonging to no package -- and the
@@ -49,20 +97,24 @@ packages = ["eval", "tracker", "utils", "helper"]
 
 [tool.pixi.workspace]
 authors = ["Di Yao <di.yao@vanderbilt.edu>"]
-# The local channel carries groundingdino-py until the feedstock publishes it.
+# One channel.  The local channel that carried groundingdino-py while the
+# feedstock was in review is gone -- conda-forge publishes both packages now.
 #
-# The `pytorch` and `nvidia` channels are gone, and with them the
+# The `pytorch` and `nvidia` channels are gone too, and with them the
 # `channel-priority = "disabled"` that pixi.toml needed to make the three
 # co-exist.  groundingdino-py-cuda is built against conda-forge's CUDA pytorch,
 # so pulling pytorch from the `pytorch` channel would put two different builds
 # of the same library in one environment.  One channel, one pytorch.
-channels = ["./../local-channel", "conda-forge"]
+channels = ["conda-forge"]
 name = "selectivetracking"
 version = "0.1.0"
 
 # The CUDA requirement rides on the platform entry; the [system-requirements]
 # table pixi.toml used for it is deprecated.
-platforms = [{ platform = "linux-64", linux = "5.15", cuda = "12.1" }]
+#
+# 12.9 rather than the 12.1 the local channel's build was compiled against:
+# conda-forge builds groundingdino-py-cuda only against `cuda-version >=12.9`.
+platforms = [{ platform = "linux-64", linux = "5.15", cuda = "12.9" }]
 
 [tool.pixi.pypi-dependencies]
 selectivetracking = { path = ".", editable = true }

@@ -63,8 +63,16 @@ RUN pip3 install --no-cache-dir \
 # Update LD_LIBRARY_PATH to include PyTorch libs (needed for CUDA extensions)
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/torch/lib:${LD_LIBRARY_PATH}
 
-# Install remaining dependencies.  The file is r.txt, not requirements.txt.
-RUN pip3 install --no-cache-dir -r r.txt
+# Install this project and its remaining dependencies.  The dependencies are the
+# `docker` extra in pyproject.toml -- there is no requirements.txt any more, and
+# the r.txt this line used to read never existed on this branch.
+#
+# torch is already installed from the cu118 index above and satisfies the extra's
+# `torch<=2.1.2`, so it is not replaced here by a PyPI CPU build.
+#
+# groundingdino-py is deliberately not in the extra: PyPI has only 0.4.0, which
+# predates the fixes this project contributed.  The clone below supplies it.
+RUN pip3 install --no-cache-dir -e '.[docker]'
 
 
 # Build GroundingDINO from the upstream project.
@@ -86,10 +94,8 @@ RUN git clone --depth 1 --branch integration/split-fixes \
     FORCE_CUDA=1 pip3 install -v --no-build-isolation . && \
     rm -rf /app/groundingdino-src
 
-# Install this project.  Pure Python now, and --no-deps because its
-# groundingdino-py requirement is satisfied by the build above rather than from
-# an index.
-RUN pip3 install --no-cache-dir --no-deps -e .
+# This project is already installed, editable, by the `.[docker]` step above --
+# it is pure Python, so nothing about it needed to wait for the CUDA build.
 
 # The installed package must win over the ./groundingdino config directory.
 # It does because that directory has no __init__.py, so it is only a namespace
