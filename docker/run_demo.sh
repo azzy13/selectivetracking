@@ -1,0 +1,241 @@
+#!/bin/bash
+#
+# Runs the full pipeline INSIDE the container and saves everything to /output.
+#
+# Intended use: start the container in one terminal, then run this script in
+# it. See DEMO.md. Produces, in /output:
+#
+#   tracked.avi        annotated video (boxes + track ids)
+#   perceptions.jsonl  one JSON object per PerceptionArray
+#   perceptions.csv    one row per perception
+#   node.log, stub.log
+#
+# Usage (inside the container):
+#   /app/GroundingDINO/docker/run_demo.sh
+#   /app/GroundingDINO/docker/run_demo.sh --seconds 60 --video videos/carla1.mp4
+#
+set -euo pipefail
+
+VIDEO="videos/color_car.mp4"
+SECONDS_TO_RUN=30
+PLAY_ONCE=0
+OUT_DIR="/output"
+# Publish rate. Also handed to ByteTrack as frame_rate, and to the video
+# writer. "auto" reads the rate out of the video file itself.
+FPS=30
+TRACK_BUFFER=""
+LOCKSTEP=""
+DEPTH="--depth"
+CAMERA_RPY="[0.0,-90.0,0.0]"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --video)    VIDEO="$2"; shift 2 ;;
+        --seconds)  SECONDS_TO_RUN="$2"; shift 2 ;;
+        --out)      OUT_DIR="$2"; shift 2 ;;
+        --fps)      FPS="$2"; shift 2 ;;
+        --track-buffer) TRACK_BUFFER="$2"; shift 2 ;;
+        --full)     PLAY_ONCE=1; shift ;;
+        --lockstep) LOCKSTEP="--lockstep"; shift ;;
+        --no-depth) DEPTH=""; shift ;;
+        --level)    CAMERA_RPY="[0.0,0.0,0.0]"; shift ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+# ROS setup scripts reference unbound variables; -u must be off while they run.
+set +u
+source /opt/ros/humble/setup.bash
+source /app/ros2_ws/install/setup.bash
+set -u
+export PYTHONPATH=/app/GroundingDINO:/app/GroundingDINO/eval:${PYTHONPATH:-}
+cd /app/GroundingDINO
+
+mkdir -p "$OUT_DIR"
+
+# Read the video's own frame rate so we can resolve --fps auto and warn when
+# the publish rate does not match what the file was recorded at.
+read -r SRC_FRAMES SRC_FPS <<<"$(python3 -c "
+import cv2
+c = cv2.VideoCapture('$VIDEO')
+n, f = int(c.get(cv2.CAP_PROP_FRAME_COUNT)), c.get(cv2.CAP_PROP_FPS)
+c.release()
+print(n, round(f, 3) if f and f > 0 else 0)" 2>/dev/null || echo "0 0")"
+
+if [ "$FPS" = "auto" ]; then
+    if [ "${SRC_FPS%%.*}" -gt 0 ] 2>/dev/null; then
+        FPS="${SRC_FPS%%.*}"
+        echo "--fps auto: using the file's own rate, ${FPS} fps"
+    else
+        FPS=30
+        echo "--fps auto: could not read a rate from $VIDEO, falling back to 30"
+    fi
+fi
+
+# Another node on the same ROS_DOMAIN_ID would publish to the same topic and
+# the recorder would mix them together. Containers sharing --ipc=host find
+# each other over shared memory even without a shared network.
+OTHER=$(ros2 node list 2>/dev/null | grep -c groundingdino_node || true)
+if [ "${OTHER:-0}" -gt 0 ]; then
+    echo ""
+    echo "ERROR: ${OTHER} groundingdino_node(s) already running on"
+    echo "       ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}. Their output would be"
+    echo "       recorded alongside this run and the results would be wrong."
+    echo "       Stop the other containers (docker ps / docker rm -f), or"
+    echo "       give this one a different ROS_DOMAIN_ID."
+    exit 1
+fi
+
+echo "========================================"
+echo "GroundingDINO -> trinity Perception"
+echo "========================================"
+echo "video:    $VIDEO"
+echo "source:   ${SRC_FRAMES} frames, recorded at ${SRC_FPS} fps"
+if [ -n "$LOCKSTEP" ]; then
+    echo "publish:  lockstep, timestamps ${FPS} fps apart (no frames dropped)"
+else
+    echo "publish:  ${FPS} fps wall clock (frames the node misses are dropped)"
+fi
+if [ "$PLAY_ONCE" -eq 1 ]; then
+    echo "duration: whole video once"
+else
+    echo "duration: ${SECONDS_TO_RUN}s (looping)"
+fi
+echo "output:   $OUT_DIR"
+echo "depth:    ${DEPTH:-off (ground-plane fallback)}"
+echo ""
+
+PIDS=()
+cleanup() {
+    echo ""
+    echo "--- stopping ---"
+    # SIGINT so the writers flush and close their files. The detection node
+    # takes a few seconds to tear down its CUDA context; without the grace
+    # period it gets SIGKILLed and bash reports a "Killed" job.
+    for pid in "${PIDS[@]}"; do kill -INT "$pid" 2>/dev/null || true; done
+    for _ in $(seq 1 15); do
+        still_running=0
+        for pid in "${PIDS[@]}"; do
+            kill -0 "$pid" 2>/dev/null && still_running=1
+        done
+        [ "$still_running" -eq 0 ] && break
+        sleep 1
+    done
+    for pid in "${PIDS[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
+    wait 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ByteTrack drops a track after int(frame_rate/30 * track_buffer) missed
+# frames, so the tracker has to be told the real frame rate or tracks expire
+# in a fraction of a second at high fps and ids churn.
+TRACK_ARGS=(-p "frame_rate:=${FPS}")
+if [ -n "$TRACK_BUFFER" ]; then
+    TRACK_ARGS+=(-p "track_buffer:=${TRACK_BUFFER}")
+fi
+LOST_FRAMES=$(python3 -c "
+buf = ${TRACK_BUFFER:-30}
+print(int(${FPS} / 30.0 * buf))" 2>/dev/null || echo "?")
+echo "      tracker: frame_rate=${FPS}, track_buffer=${TRACK_BUFFER:-30}"\
+     "-> a track survives ~${LOST_FRAMES} missed frames"
+
+echo "[1/4] starting detection + tracking node (loads the model, ~10s)"
+ros2 run groundingdino_ros groundingdino_node --ros-args \
+    -p model_weights:=/weights/groundingdino_swinb_cogcoor.pth \
+    -p camera_rpy_deg:="${CAMERA_RPY}" \
+    -p box_threshold:=0.30 \
+    -p text_threshold:=0.25 \
+    "${TRACK_ARGS[@]}" \
+    > "$OUT_DIR/node.log" 2>&1 &
+PIDS+=($!)
+NODE_PID=$!
+
+for i in $(seq 1 180); do
+    if ros2 topic list 2>/dev/null | grep -q '/vanderbilt/fake_perception/data'; then
+        echo "      node ready after ${i}s"
+        break
+    fi
+    if ! kill -0 $NODE_PID 2>/dev/null; then
+        echo "      NODE DIED:"; tail -40 "$OUT_DIR/node.log"; exit 1
+    fi
+    sleep 1
+done
+
+echo "[2/4] starting perception recorder -> $OUT_DIR/perceptions.{jsonl,csv}"
+python3 ros2_package/perception_recorder.py --output "$OUT_DIR/perceptions" \
+    > "$OUT_DIR/recorder.log" 2>&1 &
+PIDS+=($!)
+
+echo "[3/4] starting video saver -> $OUT_DIR/tracked.avi"
+python3 ros2_package/video_saver.py --output "$OUT_DIR/tracked.avi" --fps "$FPS" \
+    > "$OUT_DIR/saver.log" 2>&1 &
+PIDS+=($!)
+
+LOOP="--loop"
+[ "$PLAY_ONCE" -eq 1 ] && LOOP=""
+
+echo "[4/4] starting AirSim stub publisher ($VIDEO)"
+python3 ros2_package/sim_stub_publisher.py \
+    --video "$VIDEO" --fps "$FPS" ${LOOP} ${DEPTH} ${LOCKSTEP} \
+    > "$OUT_DIR/stub.log" 2>&1 &
+STUB_PID=$!
+PIDS+=($STUB_PID)
+
+echo ""
+if [ "$PLAY_ONCE" -eq 1 ]; then
+    EST=$(python3 -c "print(f'{$SRC_FRAMES/$FPS:.0f}')" 2>/dev/null || echo "?")
+    echo "playing all ${SRC_FRAMES} frames at ${FPS} fps -> ~${EST}s if the"
+    echo "pipeline keeps up; longer if it cannot, which is harmless because"
+    echo "the stub stamps frames from a synthetic clock, not wall clock."
+    # The stub exits on its own once the video runs out.
+    wait "$STUB_PID" || true
+    echo "stub finished"
+else
+    echo "running for ${SECONDS_TO_RUN}s ..."
+    sleep "$SECONDS_TO_RUN"
+fi
+
+cleanup
+trap - EXIT
+
+# Container runs as root, so everything in the mounted /output lands
+# root-owned. Hand it back if the caller passed their ids.
+if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+    chown -R "${HOST_UID}:${HOST_GID}" "$OUT_DIR" 2>/dev/null || true
+fi
+
+echo ""
+echo "========================================"
+echo "Output in $OUT_DIR"
+echo "========================================"
+ls -la "$OUT_DIR"
+echo ""
+echo "--- projection path used ---"
+grep -E 'Projecting via|Depth stream|entities of interest' "$OUT_DIR/node.log" | tail -5 || true
+echo ""
+echo "--- first perceptions (csv) ---"
+head -6 "$OUT_DIR/perceptions.csv" || true
+echo ""
+echo "--- frames: published vs processed ---"
+PUBLISHED=$(grep -oP 'published \K[0-9]+' "$OUT_DIR/stub.log" | tail -1 || echo "?")
+PROCESSED=$(wc -l < "$OUT_DIR/perceptions.jsonl" 2>/dev/null || echo 0)
+echo "published=${PUBLISHED} processed=${PROCESSED}"
+if [ "$PUBLISHED" != "?" ] && [ "${PROCESSED:-0}" -gt 0 ]; then
+    python3 -c "
+pub, proc = $PUBLISHED, $PROCESSED
+if proc < pub * 0.95:
+    print(f'  {100*(pub-proc)/pub:.0f}% of frames were dropped: the node could'
+          f' not keep up at this publish rate.')
+    print('  Re-run with --lockstep to process every frame.')
+else:
+    print('  every frame processed')" 2>/dev/null || true
+fi
+
+echo ""
+echo "--- distinct track ids ---"
+awk -F, 'NR>1{print $3}' "$OUT_DIR/perceptions.csv" 2>/dev/null | sort -un | wc -l
+
+echo ""
+echo "--- tracks matched to an entity of interest ---"
+awk -F, 'NR>1 && $4 != "" {print $4}' "$OUT_DIR/perceptions.csv" 2>/dev/null \
+    | sort | uniq -c || true

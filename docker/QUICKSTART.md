@@ -130,3 +130,40 @@ GroundingDINO/
 └── ros2_package/
     └── groundingdino_ros/
 ```
+
+
+
+Terminal 1 — start the container once:
+
+cd /isis/home/hasana3/vlmtest/GroundingDINO
+mkdir -p outputs/demo /tmp/briefing
+
+cat > /tmp/briefing/config.json <<'JSON'
+{"entities_of_interest": [
+  {"entity_id": "Car495", "entity_type": "Car",
+   "attributes": {"color": "black", "class": "SEDAN.1"}}]}
+JSON
+
+docker run -d --name gd_demo --gpus all --ipc=host \
+  -e ROS_DOMAIN_ID=0 -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) \
+  -v "$PWD/weights:/weights:ro" \
+  -v "$PWD/videos:/app/GroundingDINO/videos:ro" \
+  -v "$PWD/ros2_package:/app/GroundingDINO/ros2_package:ro" \
+  -v "$PWD/docker:/app/GroundingDINO/docker:ro" \
+  -v /tmp/briefing:/mission_briefing:ro \
+  -v "$PWD/outputs/demo:/output:rw" \
+  --entrypoint sleep groundingdino_ros:latest infinity
+
+Run inference:
+
+docker exec gd_demo /app/GroundingDINO/docker/run_demo.sh --seconds 30
+
+Options: --video videos/carla1.mp4, --seconds 60, --no-depth, --level.
+
+Look at the results (on the host, no sudo needed):
+
+ls -la outputs/demo/
+vlc outputs/demo/tracked.avi          # or scp it back
+column -s, -t outputs/demo/perceptions.csv | head
+
+Cleanup: docker rm -f gd_demo

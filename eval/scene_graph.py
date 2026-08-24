@@ -23,12 +23,18 @@ from typing import List, Optional, Dict, Any
 import cv2
 import numpy as np
 
+# Single-source the role vocabulary from the grounding layer so a node's role
+# string can never drift from the one the scorer checks.  query_grounding
+# deliberately imports nothing from here, so this stays acyclic.
+from query_grounding import ROLE_ANCHOR, ROLE_TARGET
+
 
 # ---------------------------------------------------------------------------
 # LAB color classifier
 # ---------------------------------------------------------------------------
 
-def _classify_lab_patch(L: float, a_raw: float, b_raw: float) -> str:
+def _classify_lab_patch(L: float, a_raw: float, b_raw: float,
+                        gt_vocabulary: bool = False) -> str:
     """Classify one mean-LAB patch value into a color name.
 
     Uses CIE L*a*b* instead of HSV because:
@@ -39,6 +45,21 @@ def _classify_lab_patch(L: float, a_raw: float, b_raw: float) -> str:
 
     OpenCV stores LAB as uint8 with L in [0,255] and a,b in [0,255]
     centered at 128, so a and b are shifted back to the signed range here.
+
+    gt_vocabulary=True switches to hue bins measured against the benchmark's
+    colour vocabulary (red, orange, yellow, green, blue, violet, white,
+    black) and is what the ROS2 perception output uses.  It differs from the
+    default in three ways:
+
+      - violet is split out of blue (measured: violet -48..-44 deg,
+        blue -74..-54 deg -- adjacent but separable at -51),
+      - the orange/yellow/green bounds are moved to where those hues
+        actually land (measured yellow is 97..103 deg, which the default
+        bins call green),
+      - achromatic dark/light are named black/white.
+
+    It is off by default so the offline eval path keeps the exact bins its
+    numbers were produced with.
     """
     a = a_raw - 128.0  # signed: negative=green, positive=red
     b = b_raw - 128.0  # signed: negative=blue,  positive=yellow
@@ -50,6 +71,23 @@ def _classify_lab_patch(L: float, a_raw: float, b_raw: float) -> str:
     # (e.g. shadowed or distant car panels) are not dropped as achromatic.
     if chroma >= 15:
         angle = math.degrees(math.atan2(b, a))  # [-180, 180]
+
+        if gt_vocabulary:
+            # Explicit bounds on every branch: an open-ended "angle < 82"
+            # would also swallow every negative (blue/violet) angle.
+            if -15 <= angle < 48:
+                return "red"
+            elif 48 <= angle < 82:
+                return "orange"
+            elif 82 <= angle < 120:
+                return "yellow"
+            elif 120 <= angle < 160:
+                return "green"
+            elif -51 <= angle < -15:
+                return "violet"
+            else:                      # 160..180 and -180..-51
+                return "blue"
+
         # Red:    -30 to  45  (a* >> 0; extended to catch warm/orange-red;
         #                       real red cars in CARLA land at ~20-35°)
         # Orange:  45 to  65
@@ -69,13 +107,14 @@ def _classify_lab_patch(L: float, a_raw: float, b_raw: float) -> str:
 
     # Achromatic: classify by lightness (L in [0, 255] in OpenCV)
     if L < 80:
-        return "dark"
+        return "black" if gt_vocabulary else "dark"
     elif L > 200:
-        return "light"
+        return "white" if gt_vocabulary else "light"
     return "gray"
 
 
-def _dominant_color_from_crop(crop_bgr: np.ndarray, grid_size: int = 4):
+def _dominant_color_from_crop(crop_bgr: np.ndarray, grid_size: int = 4,
+                              gt_vocabulary: bool = False):
     """Return (dominant_color_str, votes_dict) using patch-based LAB voting."""
     if crop_bgr is None or crop_bgr.size == 0:
         return "unknown", {}
@@ -96,7 +135,7 @@ def _dominant_color_from_crop(crop_bgr: np.ndarray, grid_size: int = 4):
             if patch.size == 0:
                 continue
             mean_px = np.mean(patch.reshape(-1, 3), axis=0)
-            color = _classify_lab_patch(*mean_px)
+            color = _classify_lab_patch(*mean_px, gt_vocabulary=gt_vocabulary)
             votes[color] = votes.get(color, 0) + 1
 
     if not votes:
@@ -106,7 +145,8 @@ def _dominant_color_from_crop(crop_bgr: np.ndarray, grid_size: int = 4):
 
 
 def _get_track_color(frame_bgr: np.ndarray, x: float, y: float,
-                     w: float, h: float) -> tuple[str, dict]:
+                     w: float, h: float,
+                     gt_vocabulary: bool = False) -> tuple[str, dict]:
     """Extract dominant color for a track's bounding box crop.
 
     For very small crops (< 8px in either dimension), the crop is upscaled to
@@ -129,7 +169,7 @@ def _get_track_color(frame_bgr: np.ndarray, x: float, y: float,
         scale = max(16 / ch, 16 / cw)
         crop = cv2.resize(crop, (max(16, int(cw * scale)), max(16, int(ch * scale))),
                           interpolation=cv2.INTER_NEAREST)
-    return _dominant_color_from_crop(crop)
+    return _dominant_color_from_crop(crop, gt_vocabulary=gt_vocabulary)
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +209,16 @@ class SceneGraphBuilder:
     OVERLAP_THRESH = 0.05   # IoU ≥ this → "overlapping"
     CLIP_SIM_THRESH = 0.85  # cosine sim ≥ this → "visually-similar"
 
-    def __init__(self, text_prompt: str = ""):
+    def __init__(self, text_prompt: str = "", gt_vocabulary: bool = False,
+                 max_frames: Optional[int] = None):
         self.text_prompt = text_prompt
+        # Name colours in the benchmark's vocabulary rather than the default
+        # LAB labels.  Off by default: the offline eval path keeps its bins.
+        self.gt_vocabulary = bool(gt_vocabulary)
+        # Retain only the last max_frames graphs.  None (the default) keeps
+        # every frame, which is what save_jsonl() needs offline; a live node
+        # sets a cap so a long mission does not grow without bound.
+        self.max_frames = max_frames
         self.frames: List[Dict[str, Any]] = []
         # Track motion history: track_id -> deque[(cx_norm, cy_norm, area_norm)]
         self._history: Dict[int, deque] = {}
@@ -186,20 +234,29 @@ class SceneGraphBuilder:
         img_h: int,
         img_w: int,
         frame_bgr: Optional[np.ndarray] = None,
+        roles: Optional[Dict[int, str]] = None,
     ) -> Dict[str, Any]:
         """
         Build scene graph for one frame.
+
+        The graph is built over ALL candidates handed to it — target candidates
+        and anchors alike — before anything is filtered or scored.  That is the
+        point: an anchor that never becomes a node can never be related to.
 
         Args:
             frame_id:  integer frame index
             tracks:    list of STrack objects (ByteTrack or CLIPTracker)
             img_h/w:   original image dimensions
             frame_bgr: optional BGR frame for color extraction
+            roles:     optional {track_id: 'target_candidate' | 'anchor'} from
+                       ``query_grounding.assign_track_roles``.  Omitted (the
+                       default) means every node is a target candidate, which is
+                       the pre-Week-3 behaviour.
 
         Returns:
             dict with keys: frame_id, prompt, nodes, edges
         """
-        nodes = [self._build_node(t, img_h, img_w, frame_bgr) for t in tracks]
+        nodes = [self._build_node(t, img_h, img_w, frame_bgr, roles) for t in tracks]
 
         # Update motion history before computing motion relations
         for n in nodes:
@@ -216,26 +273,37 @@ class SceneGraphBuilder:
             n["heading_vec"]  = motion_attrs["heading_vec"]
             n["heading_deg"]  = motion_attrs["heading_deg"]
 
-        # Pairwise edges
+        # Pairwise edges.  An edge with no relation labels is normally pruned,
+        # but an anchor is required to have an edge to every target candidate —
+        # "no relation held this frame" is itself information the scorer needs,
+        # and a missing edge is indistinguishable from a missing node.
         edges = []
         for i in range(len(nodes)):
             for j in range(i + 1, len(nodes)):
                 rels = self._compute_relations(nodes[i], nodes[j], tracks[i], tracks[j])
-                if rels:
+                spans_anchor = (
+                    nodes[i]["role"] == ROLE_ANCHOR or nodes[j]["role"] == ROLE_ANCHOR
+                )
+                if rels or spans_anchor:
                     edges.append({
                         "source": nodes[i]["track_id"],
                         "target": nodes[j]["track_id"],
                         "relations": rels,
                     })
 
+        n_anchor = sum(1 for n in nodes if n["role"] == ROLE_ANCHOR)
         frame_graph = {
             "frame_id": frame_id,
             "prompt": self.text_prompt,
             "num_tracks": len(nodes),
+            "num_target_candidates": len(nodes) - n_anchor,
+            "num_anchors": n_anchor,
             "nodes": nodes,
             "edges": edges,
         }
         self.frames.append(frame_graph)
+        if self.max_frames is not None and len(self.frames) > self.max_frames:
+            del self.frames[:-self.max_frames]
         return frame_graph
 
     def save_jsonl(self, path: str):
@@ -253,11 +321,14 @@ class SceneGraphBuilder:
             return {"total_frames": 0}
         total_nodes = sum(fg["num_tracks"] for fg in self.frames)
         total_edges = sum(len(fg["edges"]) for fg in self.frames)
+        total_anchors = sum(fg.get("num_anchors", 0) for fg in self.frames)
         n = len(self.frames)
         return {
             "total_frames": n,
             "avg_nodes_per_frame": round(total_nodes / n, 2),
             "avg_edges_per_frame": round(total_edges / n, 2),
+            "avg_anchor_nodes_per_frame": round(total_anchors / n, 2),
+            "frames_with_anchor": sum(1 for fg in self.frames if fg.get("num_anchors", 0)),
             "total_unique_tracks": len(self._history),
         }
 
@@ -271,6 +342,7 @@ class SceneGraphBuilder:
         img_h: int,
         img_w: int,
         frame_bgr: Optional[np.ndarray],
+        roles: Optional[Dict[int, str]] = None,
     ) -> Dict[str, Any]:
         x, y, w, h = track.tlwh
         cx = x + w / 2.0
@@ -284,6 +356,9 @@ class SceneGraphBuilder:
 
         node: Dict[str, Any] = {
             "track_id":    int(track.track_id),
+            # 'target_candidate' unless grounding says otherwise.  Anchors are
+            # graph scaffolding: they are scored against, never emitted.
+            "role":        (roles or {}).get(int(track.track_id), ROLE_TARGET),
             "bbox_tlwh":   [round(float(v), 1) for v in (x, y, w, h)],
             "cx_norm":     round(cx_norm, 4),
             "cy_norm":     round(cy_norm, 4),
@@ -300,7 +375,8 @@ class SceneGraphBuilder:
         }
 
         if frame_bgr is not None:
-            color, votes = _get_track_color(frame_bgr, x, y, w, h)
+            color, votes = _get_track_color(
+                frame_bgr, x, y, w, h, gt_vocabulary=self.gt_vocabulary)
             node["color"]        = color
             node["color_votes"]  = votes
 
@@ -492,6 +568,20 @@ class SceneGraphMissionFilter:
     # Public API
     # ------------------------------------------------------------------
 
+    def score_tracks(self, frame_graph: Dict[str, Any]) -> Dict[int, float]:
+        """Return {track_id: mission score} for this frame's scene graph.
+
+        Accumulates colour evidence as a side effect, so call it once per
+        frame.  decide() is this plus a threshold; the ROS2 perception path
+        wants the scores themselves, for Perception.match_prob.
+        """
+        scores: Dict[int, float] = {}
+        for node in frame_graph.get("nodes", []):
+            tid = node["track_id"]
+            self._accumulate_color(tid, node.get("color_votes", {}))
+            scores[tid] = self._score_node(node, tid)
+        return scores
+
     def decide(self, frame_graph: Dict[str, Any]) -> set:
         """
         Return set of track_ids to keep from this frame's scene graph.
@@ -499,18 +589,9 @@ class SceneGraphMissionFilter:
         Args:
             frame_graph: dict returned by SceneGraphBuilder.update()
         """
-        kept = set()
-        for node in frame_graph.get("nodes", []):
-            tid = node["track_id"]
-            self._accumulate_color(tid, node.get("color_votes", {}))
-            score = self._score_node(node, tid)
-            if self.hard_mode:
-                if score >= 1.0:
-                    kept.add(tid)
-            else:
-                if score >= self.score_thresh:
-                    kept.add(tid)
-        return kept
+        threshold = 1.0 if self.hard_mode else self.score_thresh
+        return {tid for tid, score in self.score_tracks(frame_graph).items()
+                if score >= threshold}
 
     def get_track_color_evidence(self, track_id: int) -> Dict[str, Any]:
         """Return accumulated color vote stats for a track (for debugging)."""
