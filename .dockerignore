@@ -83,6 +83,11 @@ ENV/
 env.bak/
 venv.bak/
 
+# The solved pixi environment -- ~12 GB of it.  Dockerfile.spool builds its own
+# from pixi.lock inside the image, so sending this would be pure build-context
+# cost, and it would land on top of the environment the image just solved.
+.pixi/
+
 # IDE
 .vscode/
 .idea/

@@ -122,7 +122,9 @@ cython_bbox = "*"
 clip = "*"
 
 [tool.pixi.dependencies]
-python = "3.10.*"
+# Shared by every environment below.  The Python pin is deliberately NOT here --
+# it lives in the `py310` feature, because the `ros` environment cannot have it;
+# see [tool.pixi.feature.ros] for why.
 pip = ">=26.0.1,<27"
 
 # The detector, as a package.  `groundingdino-py` is the detector itself, pure
@@ -160,6 +162,64 @@ addict = "*"
 yapf = "*"
 pycocotools = "*"
 
+# ── environments ─────────────────────────────────────────────────────────────
+# Two: the developer/spool environment, and the one the ROS image installs.
+# Both draw on [tool.pixi.dependencies] above, so the application's dependency
+# list is still stated once.  Only what genuinely differs is split out.
+
+[tool.pixi.feature.py310.dependencies]
+# 3.10 is what this project has always used.  It is a feature rather than a
+# plain dependency only so that the `ros` environment can pick a different one.
+python = "3.10.*"
+
+[tool.pixi.feature.ros]
+# RoboStack, which is NOT on conda-forge -- `ros-humble-*` lives on its own
+# channel.  Scoping it to this feature keeps the default environment
+# conda-forge-only, as the workspace comment above describes.
+channels = ["robostack-humble", "conda-forge"]
+
+[tool.pixi.feature.ros.dependencies]
+# 3.12, not 3.10, and this is forced rather than chosen: RoboStack publishes
+# linux-64 humble builds for 3.9, 3.11 and 3.12 only, and 3.12 is the one the
+# current release (rclpy 3.3.21) is built for.  It resolves because
+# groundingdino-py-cuda also has a cuda129_py312 build; the two would not
+# otherwise meet.
+python = "3.12.*"
+
+# The runtime the node imports -- see ros2_package/groundingdino_ros/package.xml.
+# This replaces `apt-get install ros-humble-cv-bridge ros-humble-vision-msgs`
+# and, with it, the whole reason Dockerfile.ros2 had to install everything with
+# pip: apt's rclpy is bound to the system interpreter, so a conda environment
+# could not be swapped in underneath it.  RoboStack's is a conda package, so it
+# can.
+ros-humble-rclpy = "*"
+ros-humble-cv-bridge = "*"
+ros-humble-sensor-msgs = "*"
+ros-humble-std-msgs = "*"
+ros-humble-geometry-msgs = "*"
+
+# docker-compose.groundingdino.yml sets RMW_IMPLEMENTATION=rmw_cyclonedds_cpp,
+# and the running stack has to agree on the middleware or nothing connects.
+# apt supplied this implicitly; RoboStack ships only the default RMW unless it
+# is asked for by name.
+ros-humble-rmw-cyclonedds-cpp = "*"
+
+# The toolchain colcon needs to build groundingdino_ros and trinity_msgs from
+# source, matching the buildtool_depend entries in package.xml.
+ros-humble-ament-cmake = "*"
+ros-humble-ament-cmake-python = "*"
+ros-humble-rosidl-default-generators = "*"
+ros-humble-rosidl-default-runtime = "*"
+ros-humble-ros-workspace = "*"
+colcon-common-extensions = "*"
+cmake = "*"
+ninja = "*"
+pkg-config = "*"
+
+[tool.pixi.environments]
+default = ["py310"]
+ros = ["ros"]
+
 [tool.pixi.tasks.demo]
 cmd = "python3 demo/inference_w_worker.py --video ../videos/carla1.mp4 --output ../output_2/annotated.mp4 --text-prompt \"red car.\" --fp16"
 description = "Run inference on a sample CARLA video with the 'red car' prompt"
@@ -173,5 +233,8 @@ cmd = "bash scripts/nu-clear.sh"
 description = "Remove all build artifacts and caches for a clean slate"
 
 # `build` is gone with setup.py: there is no extension to compile here any more.
-# `conda-build` is gone too -- recipe.yaml built the detector, which the
-# feedstock now owns.
+#
+# recipe.yaml is still here, but it no longer builds the detector -- that is the
+# feedstock's job now.  It packages *this* project, pure Python and noarch:
+#
+#     rattler-build build --recipe recipe.yaml --channel conda-forge

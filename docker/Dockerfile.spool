@@ -1,0 +1,136 @@
+# syntax=docker/dockerfile:1
+#
+# Selective tracking as a spool-directory batch worker.  No ROS.
+#
+# `Dockerfile.ros2` installs everything with pip onto a `ros:humble` base,
+# because rclpy and cv_bridge come from apt bound to the system interpreter, so
+# a conda environment cannot be swapped in underneath them.  Nothing in this
+# image imports rclpy, which means that constraint is gone and the environment
+# can come from `pixi.lock`.  Three things follow from that:
+#
+#   * The detector is the conda-forge `groundingdino-py` / `groundingdino-py-cuda`
+#     package.  Nothing is compiled from a vendored tree and no git clone is
+#     pinned to a fork branch.
+#   * CUDA arrives as an ordinary dependency of conda-forge's pytorch, so there
+#     is no `cuda-toolkit` apt install.  Only the host *driver* is needed, via
+#     nvidia-container-toolkit (`--gpus all`).
+#   * Versions are exactly the ones in `pixi.lock`, so the image and a developer
+#     running `pixi run` are the same environment rather than two lists that
+#     drift.
+#
+# Build (no staging script needed -- unlike the ROS image there is no
+# trinity_msgs to vendor into the context):
+#
+#     docker build -f docker/Dockerfile.spool -t selectivetracking-spool:latest .
+#
+# Run: see docker/SPOOL.md.
+
+ARG PIXI_VERSION=0.77.0
+ARG UBUNTU_VERSION=24.04
+
+
+# ── build: solve the environment ─────────────────────────────────────────────
+FROM ghcr.io/prefix-dev/pixi:${PIXI_VERSION}-noble AS build
+
+WORKDIR /app
+
+# cython_bbox publishes an sdist only (see the pypi entries in pixi.lock) and
+# compiles a C extension on install.  It is the single reason a compiler is
+# needed, and it is needed only here -- the runtime stage receives the built
+# environment, not the toolchain.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# The manifests plus the four declared packages, and nothing else.  pyproject
+# installs this project editable, so hatchling reads README.md and LICENSE and
+# the package directories have to exist for the metadata to build.  Everything
+# else is copied after the solve so that editing a demo script does not
+# re-resolve several GB of pytorch.
+COPY pyproject.toml pixi.lock README.md LICENSE ./
+COPY eval/ ./eval/
+COPY tracker/ ./tracker/
+COPY utils/ ./utils/
+# No trailing slash: `helper` is a *file*, not a directory, despite being listed
+# alongside the packages in pyproject.  `COPY helper/ ./helper/` does not fail --
+# it silently creates a directory holding `helper/helper`, and /app/helper is
+# then the wrong kind of thing.
+COPY helper ./helper
+
+# The build host has no GPU, so the __cuda virtual package is absent and the
+# solve would fail on `platforms = [{ ..., cuda = "12.9" }]`.  This asserts what
+# the *deployment* host provides; it must not be lower than the pyproject value,
+# and the container still needs a real driver at run time.
+ARG CONDA_OVERRIDE_CUDA=12.9
+ENV CONDA_OVERRIDE_CUDA=${CONDA_OVERRIDE_CUDA}
+
+RUN pixi install --locked
+
+# GroundingDINO builds a `bert-base-uncased` text encoder (text_encoder_type in
+# both model configs), which transformers otherwise fetches from HuggingFace the
+# first time a model is loaded -- on every cold container, inside the job
+# latency, and not at all on an air-gapped host.  Bake it into the image.
+ENV HF_HOME=/opt/hf-cache
+RUN pixi run --locked python -c "\
+from transformers import AutoTokenizer, BertModel; \
+AutoTokenizer.from_pretrained('bert-base-uncased'); \
+BertModel.from_pretrained('bert-base-uncased')"
+
+# The activation script, generated here because the runtime stage has no pixi
+# binary to generate it with.  Both stages keep the environment at /app/.pixi,
+# which matters: conda environments hard-code absolute paths.
+RUN pixi shell-hook --locked -s bash > /shell-hook.sh
+
+# The rest of the tree -- demo/, the two model configs under groundingdino/,
+# the spool driver.  After the solve, so it costs one cheap layer.
+COPY . /app
+
+
+# ── runtime: the solved environment, no toolchain, no pixi ───────────────────
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+
+# Deliberately bare.  The pixi environment carries its own libGL, libEGL and
+# glib (conda-forge's opencv depends on them), so the usual `libgl1 libglib2.0-0`
+# apt incantation that slim Python images need is not required here.
+# ca-certificates only, for the case where something does reach the network.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /app /app
+COPY --from=build /shell-hook.sh /shell-hook.sh
+COPY --from=build /opt/hf-cache /opt/hf-cache
+
+# COPY carries the mode from the build context, so these are already executable
+# from git -- but ENTRYPOINT fails opaquely if a checkout ever loses the bit.
+RUN chmod +x /app/docker/spool_entrypoint.sh /app/docker/spool_worker.py
+
+ENV HF_HOME=/opt/hf-cache \
+    PYTHONUNBUFFERED=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# ── the spool contract ───────────────────────────────────────────────────────
+# One volume, four directories, created at startup if absent:
+#
+#   /spool/in      drop videos here; optional <stem>.json sidecar per job
+#   /spool/work    claimed, in flight
+#   /spool/out     published results, one directory per job
+#   /spool/failed  inputs that errored, beside a .error.txt
+#
+# Weights are separate and read-only: the checkpoint is ~938 MB and versioned
+# outside this repository.
+ENV SPOOL_DIR=/spool \
+    GDINO_WEIGHTS=/weights/groundingdino_swinb_cogcoor.pth \
+    GDINO_CONFIG=/app/groundingdino/config/GroundingDINO_SwinB_cfg.py \
+    GDINO_PROMPT="red car." \
+    GDINO_EXTRA_ARGS="--fp16" \
+    SPOOL_POLL_SECONDS=2 \
+    SPOOL_SETTLE_SECONDS=5 \
+    SPOOL_SCRATCH_DIR=/var/tmp/spool-work
+
+VOLUME ["/spool", "/weights"]
+
+WORKDIR /app
+ENTRYPOINT ["/app/docker/spool_entrypoint.sh"]
+CMD ["python", "/app/docker/spool_worker.py"]
