@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import math
 from collections import deque
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -203,6 +203,11 @@ class SceneGraphBuilder:
 
     # Thresholds for spatial relations
     SPATIAL_THRESH = 0.10   # min normalised Δ to call left-of / above etc.
+    DEPTH_THRESH   = 0.02   # min normalised Δ to call behind / in-front-of.
+                            # Smaller than SPATIAL_THRESH on purpose: offsets
+                            # along the view/travel axis are foreshortened, so
+                            # the same physical gap spans far fewer pixels than
+                            # it does across the image.
     NEAR_THRESH    = 0.25   # normalised distance ≤ this → "near"
     FAR_THRESH     = 0.50   # normalised distance ≥ this → "far"
     SIZE_RATIO     = 1.30   # area ratio to call larger-than / smaller-than
@@ -220,6 +225,10 @@ class SceneGraphBuilder:
         # sets a cap so a long mission does not grow without bound.
         self.max_frames = max_frames
         self.frames: List[Dict[str, Any]] = []
+        # Image aspect (h/w), refreshed every update().  Needed because
+        # cx_norm divides by width and cy_norm by height, so the normalised
+        # space is anisotropically stretched — see _depth_relation.
+        self._aspect: float = 1.0
         # Track motion history: track_id -> deque[(cx_norm, cy_norm, area_norm)]
         self._history: Dict[int, deque] = {}
 
@@ -235,6 +244,7 @@ class SceneGraphBuilder:
         img_w: int,
         frame_bgr: Optional[np.ndarray] = None,
         roles: Optional[Dict[int, str]] = None,
+        heading_override: Optional[Dict[int, Sequence[float]]] = None,
     ) -> Dict[str, Any]:
         """
         Build scene graph for one frame.
@@ -252,10 +262,23 @@ class SceneGraphBuilder:
                        ``query_grounding.assign_track_roles``.  Omitted (the
                        default) means every node is a target candidate, which is
                        the pre-Week-3 behaviour.
+            heading_override:
+                       optional {track_id: [dx, dy]} replacing the heading
+                       ``_motion_attrs`` derives from track history.  For
+                       datasets where the history does not exist: a single-frame
+                       clip has no motion to measure, so every heading is
+                       [0, 0] and ``_depth_relation`` can only fall back to
+                       viewer-centric depth.  Supplying the true heading (see
+                       ``eval/sweep_headings.py``) lets the object-centric
+                       branch run there.  Omitted (the default) means headings
+                       come from track history — the behaviour of every live
+                       run, which has no ground truth to substitute.
 
         Returns:
             dict with keys: frame_id, prompt, nodes, edges
         """
+        self._aspect = (img_h / img_w) if img_w else 1.0
+
         nodes = [self._build_node(t, img_h, img_w, frame_bgr, roles) for t in tracks]
 
         # Update motion history before computing motion relations
@@ -273,6 +296,19 @@ class SceneGraphBuilder:
             n["heading_vec"]  = motion_attrs["heading_vec"]
             n["heading_deg"]  = motion_attrs["heading_deg"]
 
+            # An override replaces the measured heading but NOT `motion`: the
+            # motion label reports what the track history actually shows, and a
+            # supplied heading is not evidence the object moved.
+            if heading_override is not None:
+                vec = heading_override.get(n["track_id"])
+                if vec is not None:
+                    dx, dy = float(vec[0]), float(vec[1])
+                    norm = math.sqrt(dx * dx + dy * dy)
+                    if norm > 0:
+                        n["heading_vec"] = [round(dx / norm, 4), round(dy / norm, 4)]
+                        n["heading_deg"] = round(math.degrees(math.atan2(dy, dx)), 1)
+                        n["heading_source"] = "override"
+
         # Pairwise edges.  An edge with no relation labels is normally pruned,
         # but an anchor is required to have an edge to every target candidate —
         # "no relation held this frame" is itself information the scorer needs,
@@ -280,14 +316,31 @@ class SceneGraphBuilder:
         edges = []
         for i in range(len(nodes)):
             for j in range(i + 1, len(nodes)):
-                rels = self._compute_relations(nodes[i], nodes[j], tracks[i], tracks[j])
-                spans_anchor = (
-                    nodes[i]["role"] == ROLE_ANCHOR or nodes[j]["role"] == ROLE_ANCHOR
-                )
+                n1, t1 = nodes[i], tracks[i]
+                n2, t2 = nodes[j], tracks[j]
+                spans_anchor = ROLE_ANCHOR in (n1["role"], n2["role"])
+
+                # Orient anchor-spanning pairs candidate -> anchor.  The depth
+                # relation is computed in the SECOND node's frame, and unlike
+                # left-of/above it is not recoverable by swapping the label:
+                # "the bus is in front of the car, in the car's frame" says
+                # nothing about where the car is relative to the bus when the
+                # two face opposite ways.  Putting the anchor second makes the
+                # stored label answer the question the query actually asks.
+                #
+                # Note this only fixes the frame for edges that touch an anchor.
+                # On a candidate<->candidate edge the reference is whichever node
+                # the tracker happened to list second, so its behind/in-front-of
+                # label is in an arbitrary frame.  Nothing reads those — the
+                # scorer only ever looks at anchor edges — but do not start.
+                if n1["role"] == ROLE_ANCHOR and n2["role"] != ROLE_ANCHOR:
+                    n1, n2, t1, t2 = n2, n1, t2, t1
+
+                rels = self._compute_relations(n1, n2, t1, t2)
                 if rels or spans_anchor:
                     edges.append({
-                        "source": nodes[i]["track_id"],
-                        "target": nodes[j]["track_id"],
+                        "source": n1["track_id"],
+                        "target": n2["track_id"],
                         "relations": rels,
                     })
 
@@ -406,6 +459,11 @@ class SceneGraphBuilder:
         elif dy > self.SPATIAL_THRESH:
             relations.append("below")
 
+        # --- depth / along-axis ---
+        depth_rel = self._depth_relation(n1, n2, dx, dy)
+        if depth_rel:
+            relations.append(depth_rel)
+
         # --- proximity ---
         dist = math.sqrt(dx ** 2 + dy ** 2)
         if dist <= self.NEAR_THRESH:
@@ -456,6 +514,61 @@ class SceneGraphBuilder:
         elif area_norm < 0.08:
             return "medium"
         return "large"
+
+    def _depth_relation(
+        self, n1: dict, n2: dict, dx: float, dy: float
+    ) -> Optional[str]:
+        """'behind' / 'in-front-of' for n1 relative to n2, or None if too close to call.
+
+        Two frames, because prompts use both and they are not the same thing:
+
+        * **n2 has a heading** — object-centric.  Project n1's offset onto n2's
+          own direction of travel, so "behind the bus" means trailing the bus
+          down the road.  This is what an object-anchored prompt means, and it
+          is not recoverable from camera depth: a car ahead of the bus can be
+          further from the camera than the bus is.
+        * **n2 has no heading** (stationary, or too new for a history) —
+          viewer-centric fallback.  On a ground plane a nearer object sits lower
+          in the image, so vertical position orders depth.  Deliberately does
+          not compare areas: n1 and n2 are usually different classes, and a car
+          in front of a bus is still the smaller box.
+
+        ``dx``/``dy`` are n1 - n2 in normalised image coords, already computed
+        by the caller (right = +x, down = +y).
+
+        Both branches work in units of image **width**.  ``cx_norm`` divides by
+        width and ``cy_norm`` by height, so the normalised space is stretched by
+        the aspect ratio — 1.78x on a 16:9 frame.  A dot product taken there
+        over-weights the vertical term by the square of that (3.16x), which
+        would make ``DEPTH_THRESH`` mean one thing for a road running up the
+        frame and another for one running across it.  Rescaling y by the aspect
+        undoes it, and dividing by the rescaled heading's length makes ``along``
+        a signed distance rather than an unnormalised projection.
+        """
+        aspect = self._aspect
+        heading = n2.get("heading_vec") or (0.0, 0.0)
+        hx, hy = float(heading[0]), float(heading[1])
+
+        if hx or hy:
+            hy_w = hy * aspect
+            scale = math.hypot(hx, hy_w)
+            if scale == 0:
+                return None
+            # >0: n1 lies ahead of n2 along n2's own path.
+            along = (dx * hx + (dy * aspect) * hy_w) / scale
+            if along > self.DEPTH_THRESH:
+                return "in-front-of"
+            if along < -self.DEPTH_THRESH:
+                return "behind"
+            return None
+
+        # Viewer-centric fallback: lower in the image == nearer the camera.
+        depth = dy * aspect
+        if depth > self.DEPTH_THRESH:
+            return "in-front-of"
+        if depth < -self.DEPTH_THRESH:
+            return "behind"
+        return None
 
     def _motion_attrs(self, track_id: int) -> Dict[str, Any]:
         """Return motion label, heading vector and heading angle from position history.

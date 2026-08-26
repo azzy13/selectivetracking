@@ -1,0 +1,12 @@
+uint16 frame_number
+string detection_model
+float32 detection_prob
+uint16[4] bounding_box
+float32[3] center_world_coords
+float32 yaw
+float32[3] location
+float32 spawned_prob
+string[] car_type_names
+float32[] car_type_probs
+string[] color_names
+float32[] color_probs

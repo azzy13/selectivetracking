@@ -117,19 +117,87 @@ ENV ROS2_WS=/app/ros2_ws
 ENV GROUNDINGDINO_PATH=/app/GroundingDINO
 ENV PYTHONPATH=${GROUNDINGDINO_PATH}:${GROUNDINGDINO_PATH}/eval
 
-# Create .bashrc that auto-sources ROS2 (for docker exec)
-RUN echo 'source /opt/ros/humble/setup.bash' >> /root/.bashrc && \
-    echo 'source /app/ros2_ws/install/setup.bash' >> /root/.bashrc && \
-    echo 'export PYTHONPATH=/app/GroundingDINO:/app/GroundingDINO/eval:$PYTHONPATH' >> /root/.bashrc && \
-    echo 'export CUDA_HOME=/usr/local/cuda-11.8' >> /root/.bashrc && \
-    echo 'export PATH=$CUDA_HOME/bin:$PATH' >> /root/.bashrc && \
-    echo 'export LD_LIBRARY_PATH=$CUDA_HOME/lib64:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH' >> /root/.bashrc
+# Non-root user
+#
+# Reported by Ioana (ORNL, June): the container ran as root, so everything it
+# wrote into the bind-mounted /output landed on the host owned by root:root and
+# needed sudo to clean up.  A container UID has no meaning to the host kernel --
+# the host just sees the number -- so the fix is to run as the UID that owns the
+# host directory.  1000 is the first interactive user on a stock Ubuntu box.
+#
+# If your host UID differs, rebuild with it:
+#   docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) ...
+# or override per-run without rebuilding: docker run --user $(id -u):$(id -g).
+# The latter is why HOME below is world-writable -- an arbitrary --user UID has
+# no passwd entry and would otherwise have nowhere to write.
+ARG USER_NAME=dino
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN groupadd --gid ${USER_GID} ${USER_NAME} && \
+    useradd --uid ${USER_UID} --gid ${USER_GID} --create-home \
+            --shell /bin/bash ${USER_NAME}
+
+ENV HOME=/home/${USER_NAME}
+# Anything that fetches at runtime caches under HOME rather than /root:
+# GroundingDINO pulls bert-base-uncased from the Hub on first inference, and
+# ros2 launch writes its logs to $HOME/.ros/log.  Neither is baked in.
+ENV HF_HOME=${HOME}/.cache/huggingface
+ENV TORCH_HOME=${HOME}/.cache/torch
+
+# Auto-source ROS2 for docker exec.
+#
+# This lives in /etc/profile.d rather than a user's ~/.bashrc.  It used to be
+# appended to /root/.bashrc, which worked only by accident: Debian's root
+# .bashrc has no guard, so it ran even non-interactively.  Every *normal* user's
+# .bashrc -- including the one useradd copies from /etc/skel -- opens with
+#     case $- in *i*) ;; *) return;; esac
+# so anything appended after it is dead code under `docker exec bash -lc`.
+# /etc/profile.d applies to every user and every login shell, and does not
+# depend on which home directory the caller happens to land in.
+RUN printf '%s\n' \
+      'source /opt/ros/humble/setup.bash' \
+      'if [ -f /app/ros2_ws/install/setup.bash ]; then source /app/ros2_ws/install/setup.bash; fi' \
+      'export PYTHONPATH=/app/GroundingDINO:/app/GroundingDINO/eval:$PYTHONPATH' \
+      'export CUDA_HOME=/usr/local/cuda-11.8' \
+      'export PATH=$CUDA_HOME/bin:$PATH' \
+      'export LD_LIBRARY_PATH=$CUDA_HOME/lib64:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH' \
+      > /etc/profile.d/ros2_env.sh && \
+    chmod 0644 /etc/profile.d/ros2_env.sh && \
+    echo '. /etc/profile.d/ros2_env.sh' >> /root/.bashrc && \
+    echo '. /etc/profile.d/ros2_env.sh' >> ${HOME}/.bashrc
+
+# Everything above ran as root, so /app is root-owned.  Hand it to the runtime
+# user: pip installed GroundingDINO in editable mode, so imports resolve out of
+# /app/GroundingDINO and Python wants to drop __pycache__ there.
+#
+# `chmod -R a+rX` because COPY preserves the host's modes, and the host tree has
+# oddities -- ros2_package/groundingdino_ros/scripts is 0700 here.  Root ignored
+# that; a non-root user does not, and `ros2 run` reported it as the thoroughly
+# unhelpful "No executable found".  a+rX adds read everywhere and execute only
+# where execute already existed, so it never makes a data file runnable.
+#
+# HOME goes 0777, not 0755, so that `docker run --user <any uid>` still has a
+# writable home -- that UID is not ${USER_NAME} and would otherwise fall over on
+# the first Hub download or ros2 launch.  Nothing secret lives here; it is a
+# cache directory in a single-tenant container.
+RUN chown -R ${USER_UID}:${USER_GID} /app && \
+    chmod -R a+rX /app && \
+    mkdir -p ${HOME}/.ros/log ${HF_HOME} ${TORCH_HOME} && \
+    chmod -R 0777 ${HOME}
+
+# /output is a bind mount owned by the host.  Create it so a container started
+# without one still has somewhere writable to put results.
+RUN mkdir -p /output && chmod 0777 /output
 
 # Set working directory to GroundingDINO root so relative paths work
 WORKDIR /app/GroundingDINO
 
 # Expose ROS2 DDS ports
 EXPOSE 7400-7500/udp
+
+# Drop root.  Everything below this line runs as ${USER_NAME}; use
+# `docker exec -u root <container>` if you need a root shell for debugging.
+USER ${USER_NAME}
 
 ENTRYPOINT ["/app/ros2_entrypoint.sh"]
 CMD ["ros2", "launch", "groundingdino_ros", "groundingdino.launch.py"]

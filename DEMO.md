@@ -13,8 +13,9 @@ cd /isis/home/hasana3/vlmtest/GroundingDINO
 ./docker/build_ros2.sh
 ```
 
-This stages `trinity_msgs` into the build context and builds
-`groundingdino_ros:latest`.
+This stages the vendored `trinity_msgs` message definitions into the build
+context and builds `groundingdino_ros:latest`. It needs no `trinity_msgs`
+checkout — the definitions are in this repo at `ros2_package/trinity_msgs`.
 
 ### Message version skew — read this before changing the build
 
@@ -30,14 +31,24 @@ define `Detection` and `Perception` differently:
 | `TrackPose` / `TrackPoseArray` | absent | present |
 
 ROS 2 will not connect a publisher and a subscriber whose type definitions
-differ, **and it fails silently** — no error, no warning, no data. So the build
-pins 0.22 to match the stack. `build_ros2.sh` stages it with `git archive`:
+differ, **and it fails silently** — no error, no warning, no data. That is also
+why the package has to be named `trinity_msgs` and carry these exact fields:
+matching is by fully-qualified type name plus definition, so a look-alike under
+another package name would never connect. So the build pins 0.22 to match the
+stack.
+
+The 0.22 files are **vendored** at `ros2_package/trinity_msgs` (a verbatim copy
+of `31287a1`; see its README). `build_ros2.sh` stages that copy, so a fresh
+clone builds with no external checkout. Point it at a `trinity_msgs` checkout
+only to build some other revision:
 
 ```bash
-./docker/build_ros2.sh                          # 0.22, matches the stack
-TRINITY_MSGS_REF=master ./docker/build_ros2.sh  # 0.58, for when the stack moves
-TRINITY_MSGS_REF=WORKTREE ./docker/build_ros2.sh
+./docker/build_ros2.sh                          # vendored 0.22, matches the stack
+TRINITY_MSGS_REF=master   TRINITY_MSGS_SRC=/path/to/trinity_msgs ./docker/build_ros2.sh
+TRINITY_MSGS_REF=WORKTREE TRINITY_MSGS_SRC=/path/to/trinity_msgs ./docker/build_ros2.sh
 ```
+
+`TRINITY_MSGS_SRC` defaults to a `trinity_msgs` directory beside this repo.
 
 The node writes version-dependent fields through a `hasattr` guard, so one
 source works against either revision. Under 0.22, `Perception.frame_number`
@@ -82,7 +93,8 @@ cat > /tmp/briefing/config.json <<'JSON'
 JSON
 
 docker run -d --name gd_demo --gpus all --ipc=host \
-  -e ROS_DOMAIN_ID=0 -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) \
+  --user $(id -u):$(id -g) \
+  -e ROS_DOMAIN_ID=0 \
   -v "$PWD/weights:/weights:ro" \
   -v "$PWD/videos:/app/GroundingDINO/videos:ro" \
   -v "$PWD/ros2_package:/app/GroundingDINO/ros2_package:ro" \
@@ -135,6 +147,23 @@ docker exec gd_demo /app/GroundingDINO/docker/run_demo.sh \
 
 `--full` plays the video once and stops, instead of looping for `--seconds`.
 
+### `--save_video` — off by default
+
+The run writes the detection output only. Pass `--save_video` to also get
+`tracked.avi`:
+
+```bash
+docker exec gd_demo /app/GroundingDINO/docker/run_demo.sh --seconds 30 --save_video
+```
+
+Without it the video saver is not started **and** the node is launched with
+`output_visualization:=false`, so it does not draw or publish annotated frames
+either — nothing subscribes to that topic, and rendering one image per frame is
+the most expensive thing in the pipeline after inference. Detection, tracking
+and the `PerceptionArray` output are identical either way: a 20s run of
+`color_car.mp4` gives 197 frames, 2 track ids and 197 `Car495` matches with the
+flag and without it.
+
 The script refuses to start if another `groundingdino_node` is on the same
 `ROS_DOMAIN_ID`. Containers sharing `--ipc=host` discover each other over
 shared memory even without a shared network, and the recorder would silently
@@ -144,14 +173,43 @@ Everything lands in `outputs/demo/` on the host:
 
 | File | Written by | Contents |
 |---|---|---|
-| `tracked.avi` | `video_saver.py` | annotated video, boxes + track ids |
+| `tracked.avi` | `video_saver.py` | annotated video — **only with `--save_video`** |
 | `perceptions.jsonl` | `perception_recorder.py` | one JSON object per `PerceptionArray` |
 | `perceptions.csv` | `perception_recorder.py` | one row per perception |
 | `node.log` | the node | projection path, prompt, entities |
 | `stub.log`, `saver.log`, `recorder.log` | helpers | |
 
-`HOST_UID`/`HOST_GID` hand the files back to you; the container runs as root,
-so without them everything in `/output` is root-owned.
+### File ownership
+
+The container runs as a **non-root** user, `dino`, uid/gid `1000:1000`.
+
+It used to run as root, which meant everything it wrote into the bind-mounted
+`/output` landed on the host owned by `root:root` and took `sudo` to delete
+(reported by Ioana at ORNL in June). A container uid means nothing to the host
+kernel — the host only sees the number — so the fix is to run as the uid that
+owns the host directory.
+
+If your host uid is not 1000, either bake yours in at build time:
+
+```bash
+docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) \
+    -f docker/Dockerfile.ros2 -t groundingdino_ros:latest .
+```
+
+or override per run, no rebuild needed:
+
+```bash
+docker run --user $(id -u):$(id -g) ...
+```
+
+The entrypoint checks `/output` and `$HOME` for writability before starting the
+node and fails immediately with the fix if either is owned by someone else —
+the common cause being a host output directory Docker auto-created as root
+because it did not exist yet. `mkdir -p` it yourself first.
+
+`HOST_UID`/`HOST_GID` are now redundant; `run_demo.sh` still honours them under
+`docker exec -u root`, and ignores them otherwise. For a root shell inside the
+container: `docker exec -u root <container> bash`.
 
 The node itself has **no disk-output flag** — it only publishes ROS topics.
 `video_saver.py` and `perception_recorder.py` are separate subscriber nodes,

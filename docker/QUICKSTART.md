@@ -25,6 +25,11 @@ cd ..
 ./docker/build_ros2.sh
 ```
 
+Self-contained — the `trinity_msgs` message definitions the node publishes are
+vendored at `ros2_package/trinity_msgs`, so no `trinity_msgs` checkout is
+needed. See "Message version skew" in `DEMO.md` to build against a different
+revision.
+
 ### 3. Run GroundingDINO Node
 
 ```bash
@@ -128,7 +133,8 @@ GroundingDINO/
 │   ├── frames/                       ← Saved visualizations
 │   └── tracking.mp4                  ← Video output
 └── ros2_package/
-    └── groundingdino_ros/
+    ├── groundingdino_ros/
+    └── trinity_msgs/                 ← Vendored msg definitions (0.22)
 ```
 
 
@@ -145,7 +151,8 @@ cat > /tmp/briefing/config.json <<'JSON'
 JSON
 
 docker run -d --name gd_demo --gpus all --ipc=host \
-  -e ROS_DOMAIN_ID=0 -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) \
+  --user $(id -u):$(id -g) \
+  -e ROS_DOMAIN_ID=0 \
   -v "$PWD/weights:/weights:ro" \
   -v "$PWD/videos:/app/GroundingDINO/videos:ro" \
   -v "$PWD/ros2_package:/app/GroundingDINO/ros2_package:ro" \
@@ -158,12 +165,18 @@ Run inference:
 
 docker exec gd_demo /app/GroundingDINO/docker/run_demo.sh --seconds 30
 
-Options: --video videos/carla1.mp4, --seconds 60, --no-depth, --level.
+Options: --video videos/carla1.mp4, --seconds 60, --no-depth, --level,
+--save_video (off by default; without it no tracked.avi is written).
 
 Look at the results (on the host, no sudo needed):
 
 ls -la outputs/demo/
-vlc outputs/demo/tracked.avi          # or scp it back
+vlc outputs/demo/tracked.avi          # needs --save_video; or scp it back
 column -s, -t outputs/demo/perceptions.csv | head
 
 Cleanup: docker rm -f gd_demo
+
+
+docker exec gd_run /app/GroundingDINO/docker/run_demo.sh \
+  --full --lockstep --video videos/carla1.mp4 --fps 60 --track-buffer 90
+docker rm -f gd_run

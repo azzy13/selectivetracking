@@ -95,6 +95,13 @@ venv.bak/
 .gitignore
 .gitattributes
 
+# Host-local pixi environment. 15 GB, and nothing in the image uses it -- the
+# container's interpreter is the system python3, and deps come from pip.
+# Copying it in doubled the image size.
+.pixi/
+pixi.lock
+pixi.toml
+
 # Documentation (not needed in image)
 *.md
 docs/
