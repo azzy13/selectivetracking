@@ -29,7 +29,7 @@ requires-python = ">=3.10"
 # against PyPI, which fails and would be wrong even if it succeeded:
 #
 #   * groundingdino-py on PyPI is 0.4.0 and does not carry the fixes this
-#     project contributed.  The 0.4.1 that does comes from the conda feedstock,
+#     project contributed.  The >=0.4.1 that does comes from the conda feedstock,
 #     and will only reach PyPI when upstream cuts a release.
 #   * torch from PyPI beside pytorch from conda puts two builds of the same
 #     library in one environment.
@@ -49,7 +49,7 @@ dependencies = []
 #     conda            pip
 #     pytorch          torch
 #     opencv           opencv-python
-#     groundingdino-py  -- 0.4.1 is not on PyPI; the Dockerfile builds it from
+#     groundingdino-py  -- >=0.4.1 is not on PyPI; the Dockerfile builds it from
 #                          git instead, which is why it is absent below
 #
 # pixi does not resolve this table.  Extras reach an editable path dependency
@@ -133,8 +133,8 @@ pip = ">=26.0.1,<27"
 # On a machine with no NVIDIA GPU, drop the `-cuda` line -- that is all.  The
 # model then takes the pure-PyTorch fallback, which is correct but slow, and must
 # stay in float32 since grid_sample has no half-precision CPU kernel.
-groundingdino-py = ">=0.4.1"
-groundingdino-py-cuda = "*"
+groundingdino-py = ">=0.4.2"
+groundingdino-py-cuda = ">=0.4.2"
 
 # groundingdino-py-cuda already requires `pytorch *cuda*`, so the CUDA build is
 # selected by the detector rather than pinned here.  `pytorch-cuda` is gone: it
@@ -150,7 +150,8 @@ torchvision = "*"
 numpy = ">=1.26.2"
 opencv = "*"
 timm = "*"
-transformers = ">=4.49.0"
+#transformers = ">=4.49.0"
+transformers = "==4.49.0"
 supervision = ">=0.22.0"
 ipykernel = "*"
 lap = "*"
