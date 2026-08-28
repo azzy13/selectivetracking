@@ -76,11 +76,20 @@ docker = [
     "pycocotools",
     "cython_bbox",
     "lap",
-    "clip",
+    # OpenAI's CLIP, from git.  The `clip` on PyPI is an unrelated clipboard
+    # manager whose module exports nothing, so `import clip` succeeds and
+    # clip.load() raises AttributeError.  Upstream cuts no releases; pinned by
+    # commit so the two dependency paths below resolve the same code.
+    "clip @ git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6",
     "pandas",
     "motmetrics",
     "ipykernel",
 ]
+
+[tool.hatch.metadata]
+# The `docker` extra pins OpenAI's CLIP by git URL.  Hatchling rejects a direct
+# reference in optional-dependencies unless this says otherwise.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 # `groundingdino/` is deliberately absent.  What survives there is two model
@@ -119,7 +128,9 @@ platforms = [{ platform = "linux-64", linux = "5.15", cuda = "12.9" }]
 [tool.pixi.pypi-dependencies]
 selectivetracking = { path = ".", editable = true }
 cython_bbox = "*"
-clip = "*"
+# Same commit as the `docker` extra above, and for the same reason: PyPI's
+# `clip` is a clipboard manager, not OpenAI's model.
+clip = { git = "https://github.com/openai/CLIP.git", rev = "d05afc436d78f1c48dc0dbf8e5980a9d471f35f6" }
 
 [tool.pixi.dependencies]
 # Shared by every environment below.  The Python pin is deliberately NOT here --
@@ -204,6 +215,13 @@ ros-humble-geometry-msgs = "*"
 # apt supplied this implicitly; RoboStack ships only the default RMW unless it
 # is asked for by name.
 ros-humble-rmw-cyclonedds-cpp = "*"
+
+# The `ros2` command itself.  apt's ros-humble-ros-base supplied it implicitly;
+# RoboStack does not, so without this the image's own
+# CMD ["ros2", "launch", ...] exits with "exec: ros2: not found".
+# The meta-package carries the verbs this repo uses -- launch, topic, run, pkg,
+# node, interface -- and ros-humble-ros-base carries none of them.
+ros-humble-ros2cli-common-extensions = "*"
 
 # The toolchain colcon needs to build groundingdino_ros and trinity_msgs from
 # source, matching the buildtool_depend entries in package.xml.

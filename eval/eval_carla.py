@@ -216,28 +216,105 @@ def save_prompt_results(results, out_folder):
 
 
 # ----------------------------------------------------------------------
+# Query grounding (Week 3) — text prompt -> parsed Query
+# ----------------------------------------------------------------------
+def resolve_prompt(args, info):
+    """The prompt this scenario will actually be run with.
+
+    ``--text_prompt`` overrides the per-scenario prompt from gt.json.  Returned
+    without a trailing "." — the detector caption convention is applied later,
+    and the parser reads the sentence, not the caption.
+    """
+    prompt = args.text_prompt if args.text_prompt else info["text_prompt"]
+    return prompt.strip().rstrip(".").strip()
+
+
+def build_query(prompt):
+    """Parse ``prompt`` into a ``query_parser.Query``.
+
+    Raises whatever the parser raises — callers validate up front (see
+    ``validate_queries``) so a run never silently degrades to plain MOT after
+    being asked for grounding.
+    """
+    from query_parser import parse
+    return parse(prompt)
+
+
+def validate_queries(scenario_info, args):
+    """Parse every scenario's prompt before any model is loaded.
+
+    Grounding that fails halfway through a multi-GPU run wastes the whole run,
+    and falling back to plain MOT would produce output that looks grounded but
+    is not.  So every prompt is parsed here first and the run aborts if any of
+    them cannot be.
+
+    Returns:
+        ``{scenario_name: Query}``.
+    """
+    queries, failures = {}, []
+    for scenario_name, info in sorted(scenario_info.items()):
+        prompt = resolve_prompt(args, info)
+        try:
+            queries[scenario_name] = build_query(prompt)
+        except Exception as exc:
+            failures.append((scenario_name, prompt, type(exc).__name__, str(exc)))
+
+    if failures:
+        print("\nERROR: --grounded was requested but these prompts do not parse:")
+        for scenario_name, prompt, kind, msg in failures:
+            print(f"  {scenario_name}: '{prompt}'\n      {kind}: {msg}")
+        print("\nTeach the parser the phrasing (PHRASE_RELATIONS / VERB_RELATIONS /")
+        print("MODIFIER_RELATIONS in eval/query_parser.py) or drop --grounded.")
+        sys.exit(1)
+
+    from query_grounding import describe_grounding
+    print("\nQuery grounding enabled:")
+    for scenario_name, query in queries.items():
+        print(f"  {scenario_name}: {describe_grounding(query)}")
+        for note in query.notes:
+            print(f"      note: {note}")
+    return queries
+
+
+# ----------------------------------------------------------------------
 # Multi-GPU worker
 # ----------------------------------------------------------------------
 def _run_on_device(device_str, scenario_items, args, tracker_kwargs,
-                   temp_images_dir, res_dir, run_outdir):
-    """Process a batch of scenarios on a single GPU device."""
+                   temp_images_dir, res_dir, run_outdir, queries=None):
+    """Process a batch of scenarios on a single GPU device.
+
+    ``queries`` maps scenario name -> ``query_parser.Query`` when --grounded is
+    on.  A scenario with a query gets the grounded pipeline (caption carries the
+    anchor class, graph over all candidates, soft scorer); one without gets the
+    pre-Week-3 hard-filter pipeline, unchanged.
+    """
     gpu_tag = device_str.split(":")[-1] if "cuda" in device_str else "cpu"
 
     dummy_gt_root = os.path.join(run_outdir, "_gt_stub")
     os.makedirs(os.path.join(dummy_gt_root, "gt"), exist_ok=True)
 
     for scenario_name, info in scenario_items:
-        text_prompt = args.text_prompt if args.text_prompt else info["text_prompt"]
+        text_prompt = resolve_prompt(args, info)
+        query = (queries or {}).get(scenario_name)
         if not text_prompt.endswith("."):
             text_prompt += "."
 
         print(f"\n[GPU {gpu_tag}] {'=' * 50}")
         print(f"[GPU {gpu_tag}] Scenario: {scenario_name}")
         print(f"[GPU {gpu_tag}] Prompt:   '{text_prompt}'")
+        # The Worker rebuilds the caption from the query, so print what the
+        # detector will actually see rather than the sentence it came from.
+        if query is not None:
+            from query_grounding import build_detector_prompt
+            print(f"[GPU {gpu_tag}] Caption:  '{build_detector_prompt(query, dotted=True)}'")
         print(f"[GPU {gpu_tag}] Images:   {info['images_dir']}")
         print(f"[GPU {gpu_tag}] {'=' * 50}")
 
         if args.worker == "simple":
+            # WorkerSimple has no query-grounding path; validate_queries only
+            # runs for --worker clean, so this is belt-and-braces.
+            if query is not None:
+                raise ValueError("--grounded requires --worker clean")
             worker = WorkerSimple(
                 config_path=args.config,
                 weights_path=args.weights,
@@ -277,6 +354,9 @@ def _run_on_device(device_str, scenario_items, args, tracker_kwargs,
                 use_color_filter=args.use_color_filter,
                 use_scale_aware_thresh=args.use_scale_aware_thresh,
                 small_box_area_thresh=args.small_box_area_thresh,
+                query=query,
+                debug_draw_anchors=args.debug_draw_anchors,
+                answer_selection=args.answer_selection,
             )
 
         out_path = os.path.join(res_dir, f"{scenario_name}.txt")
@@ -336,6 +416,29 @@ def main():
         "--prompt_eval_mode", type=str, default="single_target",
         choices=["single_target", "all_red_sedans"],
         help="Mode for prompt-compliance evaluation.",
+    )
+
+    # Query grounding (Week 3) — see eval/query_grounding.py
+    ap.add_argument(
+        "--grounded", action=argparse.BooleanOptionalAction, default=False,
+        help="Parse each prompt into a Query and run the grounded pipeline: the "
+             "detector caption carries the anchor class too, the scene graph is "
+             "built over all candidates, and the soft subgraph scorer replaces "
+             "the referring/colour hard filters.  Requires --worker clean.",
+    )
+    ap.add_argument(
+        "--answer_selection", action=argparse.BooleanOptionalAction, default=True,
+        help="With --grounded, emit only the candidates the parsed relation "
+             "actually holds for, instead of every target candidate. A "
+             "threshold, not an argmax: a plural prompt can return several, and "
+             "a frame where nothing satisfies the relation returns nothing. "
+             "Prompts the relation layer cannot judge (plain, ego-anchored, or "
+             "no scene-graph equivalent) are passed through untouched. "
+             "--no-answer_selection restores the pre-selection behaviour.")
+    ap.add_argument(
+        "--debug_draw_anchors", action="store_true",
+        help="With --grounded and --save_video, draw anchor boxes dotted orange. "
+             "Anchors are still never written to the MOT output.",
     )
 
     # Detector (defaults from eval_referkitti.py)
@@ -432,6 +535,7 @@ def main():
     print(f"Tracker:   {args.tracker}")
     print(f"Color filter: {args.use_color_filter}")
     print(f"Spatial filter: {args.use_spatial_filter}")
+    print(f"Grounded:  {args.grounded}")
     print(f"Output:    {run_outdir}")
     print(f"{'=' * 60}\n")
 
@@ -453,6 +557,16 @@ def main():
         sys.exit(1)
 
     print(f"\nFound {len(scenario_info)} scenarios.\n")
+
+    # Query grounding: parse every prompt before loading a model, so a bad
+    # prompt fails in seconds rather than after the detector is on the GPU.
+    queries = None
+    if args.grounded:
+        if args.worker != "clean":
+            print("ERROR: --grounded requires --worker clean "
+                  f"(got --worker {args.worker}).")
+            sys.exit(1)
+        queries = validate_queries(scenario_info, args)
 
     print("Setting up image paths...")
     setup_image_symlinks(scenario_info, temp_images_dir)
@@ -505,7 +619,7 @@ def main():
             t = Thread(
                 target=_run_on_device,
                 args=(device_str, chunk, args, tracker_kwargs,
-                      temp_images_dir, res_dir, run_outdir),
+                      temp_images_dir, res_dir, run_outdir, queries),
             )
             threads.append(t)
             t.start()
@@ -515,7 +629,7 @@ def main():
     else:
         device_str = f"cuda:{devices[0]}" if torch.cuda.is_available() else "cpu"
         _run_on_device(device_str, scenario_list, args, tracker_kwargs,
-                       temp_images_dir, res_dir, run_outdir)
+                       temp_images_dir, res_dir, run_outdir, queries)
 
     # ------------------------------------------------------------------
     # Step 4: Prompt-compliance evaluation

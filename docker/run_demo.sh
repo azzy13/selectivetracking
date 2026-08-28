@@ -5,14 +5,19 @@
 # Intended use: start the container in one terminal, then run this script in
 # it. See DEMO.md. Produces, in /output:
 #
-#   tracked.avi        annotated video (boxes + track ids)
 #   perceptions.jsonl  one JSON object per PerceptionArray
 #   perceptions.csv    one row per perception
 #   node.log, stub.log
+#   tracked.avi        annotated video -- only with --save_video
+#
+# Video is off by default. Writing it costs an annotated-frame render and an
+# image publish per frame, which is the most expensive thing in the pipeline
+# after inference, and the detection output does not depend on it.
 #
 # Usage (inside the container):
 #   /app/GroundingDINO/docker/run_demo.sh
 #   /app/GroundingDINO/docker/run_demo.sh --seconds 60 --video videos/carla1.mp4
+#   /app/GroundingDINO/docker/run_demo.sh --save_video
 #
 set -euo pipefail
 
@@ -27,6 +32,7 @@ TRACK_BUFFER=""
 LOCKSTEP=""
 DEPTH="--depth"
 CAMERA_RPY="[0.0,-90.0,0.0]"
+SAVE_VIDEO=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --lockstep) LOCKSTEP="--lockstep"; shift ;;
         --no-depth) DEPTH=""; shift ;;
         --level)    CAMERA_RPY="[0.0,0.0,0.0]"; shift ;;
+        --save_video) SAVE_VIDEO=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -103,26 +110,51 @@ else
 fi
 echo "output:   $OUT_DIR"
 echo "depth:    ${DEPTH:-off (ground-plane fallback)}"
+if [ "$SAVE_VIDEO" -eq 1 ]; then
+    echo "annotated: $OUT_DIR/tracked.avi"
+else
+    echo "annotated: off (pass --save_video to write $OUT_DIR/tracked.avi)"
+fi
 echo ""
 
 PIDS=()
+
+# `ros2 run` is a wrapper: it forks the node and waits.  $! is the wrapper, so
+# signalling only the recorded pid leaves the node itself alive -- reparented to
+# pid 1, still on the topic, and the next run then aborts on the cross-talk
+# guard.  Signal the whole descendant tree instead, deepest first.
+kill_tree() {
+    local pid=$1 sig=$2 child
+    for child in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$child" "$sig"; done
+    kill "-$sig" "$pid" 2>/dev/null || true
+}
+tree_alive() {
+    local pid
+    for pid in "${PIDS[@]}"; do
+        kill -0 "$pid" 2>/dev/null && return 0
+        pgrep -P "$pid" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
 cleanup() {
     echo ""
     echo "--- stopping ---"
     # SIGINT so the writers flush and close their files. The detection node
     # takes a few seconds to tear down its CUDA context; without the grace
     # period it gets SIGKILLed and bash reports a "Killed" job.
-    for pid in "${PIDS[@]}"; do kill -INT "$pid" 2>/dev/null || true; done
+    for pid in "${PIDS[@]}"; do kill_tree "$pid" INT; done
     for _ in $(seq 1 15); do
-        still_running=0
-        for pid in "${PIDS[@]}"; do
-            kill -0 "$pid" 2>/dev/null && still_running=1
-        done
-        [ "$still_running" -eq 0 ] && break
+        tree_alive || break
         sleep 1
     done
-    for pid in "${PIDS[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
+    for pid in "${PIDS[@]}"; do kill_tree "$pid" KILL; done
     wait 2>/dev/null || true
+
+    # Belt and braces: anything of ours that got reparented away from this
+    # shell, so `pgrep -P` can no longer see it from the recorded pids.
+    pkill -9 -u "$(id -u)" -f 'groundingdino_ros/groundingdino_node' 2>/dev/null || true
+    pkill -9 -u "$(id -u)" -f 'ros2_package/(video_saver|perception_recorder|sim_stub_publisher)\.py' 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -133,13 +165,28 @@ TRACK_ARGS=(-p "frame_rate:=${FPS}")
 if [ -n "$TRACK_BUFFER" ]; then
     TRACK_ARGS+=(-p "track_buffer:=${TRACK_BUFFER}")
 fi
+
+# Without --save_video nothing subscribes to the annotated image topic, so stop
+# the node drawing and publishing frames for no reader.  Detection, tracking and
+# the PerceptionArray output are unaffected -- this gates rendering only.
+if [ "$SAVE_VIDEO" -eq 1 ]; then
+    TRACK_ARGS+=(-p "output_visualization:=true")
+else
+    TRACK_ARGS+=(-p "output_visualization:=false")
+fi
+
+# Steps are numbered for the operator; the video saver is one of them only when
+# it actually runs.
+N_STEPS=$((3 + SAVE_VIDEO))
+STEP=0
+step() { STEP=$((STEP + 1)); echo "[${STEP}/${N_STEPS}] $*"; }
 LOST_FRAMES=$(python3 -c "
 buf = ${TRACK_BUFFER:-30}
 print(int(${FPS} / 30.0 * buf))" 2>/dev/null || echo "?")
 echo "      tracker: frame_rate=${FPS}, track_buffer=${TRACK_BUFFER:-30}"\
      "-> a track survives ~${LOST_FRAMES} missed frames"
 
-echo "[1/4] starting detection + tracking node (loads the model, ~10s)"
+step "starting detection + tracking node (loads the model, ~10s)"
 ros2 run groundingdino_ros groundingdino_node --ros-args \
     -p model_weights:=/weights/groundingdino_swinb_cogcoor.pth \
     -p camera_rpy_deg:="${CAMERA_RPY}" \
@@ -161,20 +208,22 @@ for i in $(seq 1 180); do
     sleep 1
 done
 
-echo "[2/4] starting perception recorder -> $OUT_DIR/perceptions.{jsonl,csv}"
+step "starting perception recorder -> $OUT_DIR/perceptions.{jsonl,csv}"
 python3 ros2_package/perception_recorder.py --output "$OUT_DIR/perceptions" \
     > "$OUT_DIR/recorder.log" 2>&1 &
 PIDS+=($!)
 
-echo "[3/4] starting video saver -> $OUT_DIR/tracked.avi"
-python3 ros2_package/video_saver.py --output "$OUT_DIR/tracked.avi" --fps "$FPS" \
-    > "$OUT_DIR/saver.log" 2>&1 &
-PIDS+=($!)
+if [ "$SAVE_VIDEO" -eq 1 ]; then
+    step "starting video saver -> $OUT_DIR/tracked.avi"
+    python3 ros2_package/video_saver.py --output "$OUT_DIR/tracked.avi" --fps "$FPS" \
+        > "$OUT_DIR/saver.log" 2>&1 &
+    PIDS+=($!)
+fi
 
 LOOP="--loop"
 [ "$PLAY_ONCE" -eq 1 ] && LOOP=""
 
-echo "[4/4] starting AirSim stub publisher ($VIDEO)"
+step "starting AirSim stub publisher ($VIDEO)"
 python3 ros2_package/sim_stub_publisher.py \
     --video "$VIDEO" --fps "$FPS" ${LOOP} ${DEPTH} ${LOCKSTEP} \
     > "$OUT_DIR/stub.log" 2>&1 &
@@ -198,9 +247,11 @@ fi
 cleanup
 trap - EXIT
 
-# Container runs as root, so everything in the mounted /output lands
-# root-owned. Hand it back if the caller passed their ids.
-if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+# The container now runs as a non-root user whose uid matches the host's, so
+# output already lands owned by the caller and this is a no-op.  Kept for images
+# built before that change, and for `docker exec -u root`, where it still does
+# the work.  Skipped when we are not root -- chown would only fail.
+if [ "$(id -u)" = "0" ] && [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
     chown -R "${HOST_UID}:${HOST_GID}" "$OUT_DIR" 2>/dev/null || true
 fi
 

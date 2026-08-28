@@ -773,6 +773,7 @@ class Worker:
         # Query grounding (Week 3) — see query_grounding.py
         query=None,                          # a query_parser.Query, or None
         debug_draw_anchors: bool = False,    # dotted anchor boxes in debug video
+        answer_selection: bool = True,       # emit only candidates the relation holds for
         # Scale-aware detection
         use_scale_aware_thresh: bool = True,
         small_box_area_thresh: int = 5000,
@@ -792,6 +793,10 @@ class Worker:
         # hard filters are replaced by the soft subgraph scorer.  Without one,
         # every path below behaves exactly as it did before Week 3.
         self.query = query
+        # Apply the selection policy to grounded output.  Off means every target
+        # candidate is emitted regardless of the relation — what --grounded did
+        # before selection existed, kept so the two can be compared.
+        self.answer_selection = bool(answer_selection)
         self.grounding_enabled = query is not None
         self.debug_draw_anchors = bool(debug_draw_anchors)
         self._track_roles: Dict[int, str] = {}   # role memory across frames
@@ -1190,7 +1195,7 @@ class Worker:
         if self.grounding_enabled:
             from query_grounding import (anchor_tracks, assign_track_roles,
                                          draw_dotted_rect, emitted_tracks,
-                                         score_candidates)
+                                         score_candidates, select_answers)
 
         with open(out_path, "w") as f_res:
             for idx, frame_name in enumerate(frame_files):
@@ -1264,11 +1269,21 @@ class Worker:
                 # replaces the hard filter; nothing is dropped by scoring.
                 if self.grounding_enabled and frame_graph is not None:
                     weights = score_candidates(frame_graph, self.query)
-                    out_tracks = emitted_tracks(tracks, track_roles)
+                    candidates = emitted_tracks(tracks, track_roles)
+                    # Scoring ranks; selection decides.  A threshold, not an
+                    # argmax — see select_answers.  With selection off, every
+                    # candidate is emitted, which is the pre-selection
+                    # behaviour and the honest baseline to compare against.
+                    if self.answer_selection:
+                        out_tracks = select_answers(candidates, frame_graph,
+                                                    self.query, weights)
+                    else:
+                        out_tracks = candidates
                     if show_detail:
-                        print(f" → cand={len(out_tracks)} "
+                        print(f" → cand={len(candidates)} "
                               f"anchor={frame_graph['num_anchors']} "
-                              f"scored={len(weights)}", end="")
+                              f"scored={len(weights)} "
+                              f"answers={len(out_tracks)}", end="")
                 else:
                     out_tracks = tracks
 
@@ -1286,8 +1301,10 @@ class Worker:
                 if self.save_video and video_writer is not None:
                     vis_frame = img.copy()
 
-                    # Draw predicted tracks (green, solid).  Target candidates
-                    # only — same list that gets written out.
+                    # Draw predicted tracks (green, solid).  This is out_tracks,
+                    # the same list that gets written out — under answer
+                    # selection that is the answers, not every candidate, so a
+                    # candidate the relation rejected is drawn nowhere.
                     for t in out_tracks:
                         x, y, w, h = t.tlwh
                         if w * h > self.min_box_area:

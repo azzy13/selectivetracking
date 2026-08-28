@@ -119,8 +119,10 @@ def _spec(name, kind, arity, temporal, ego_relative=False, hint=None) -> Relatio
 #: parsed query.  Keyed by canonical relation name.
 RELATIONS: Dict[str, RelationSpec] = {
     # --- spatial_instant (binary, single-frame geometry) -------------------
-    "behind":      _spec("behind", "spatial_instant", "binary", False),
-    "in_front_of": _spec("in_front_of", "spatial_instant", "binary", False),
+    "behind":      _spec("behind", "spatial_instant", "binary", False,
+                         hint="edge 'behind'"),
+    "in_front_of": _spec("in_front_of", "spatial_instant", "binary", False,
+                         hint="edge 'in-front-of'"),
     "left_of":     _spec("left_of", "spatial_instant", "binary", False,
                          hint="edge 'left-of'"),
     "right_of":    _spec("right_of", "spatial_instant", "binary", False,

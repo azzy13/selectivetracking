@@ -7,6 +7,11 @@ services:
   groundingdino:
     image: groundingdino_ros:latest
     container_name: groundingdino_${USER:-user}
+    # Run as the host user so files written into the mounted output directory
+    # are owned by you, not by root.  The image's baked-in user is 1000:1000;
+    # export HOST_UID/HOST_GID if yours differs:
+    #   HOST_UID=$(id -u) HOST_GID=$(id -g) docker-compose up groundingdino
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     networks:
       - ros_network
     environment:

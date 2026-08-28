@@ -1,51 +1,22 @@
 # syntax=docker/dockerfile:1
 #
-# GroundingDINO ROS 2 node, built from pixi.lock against RoboStack.
-#
-# This image used to be `FROM ros:humble-ros-base` with everything installed by
-# pip and apt.  That was forced: apt's rclpy and cv_bridge are bound to the
-# system interpreter, so no conda environment could be swapped in underneath
-# them, so the detector had to be compiled here from a git clone --
-# `apt-get install cuda-toolkit-11-8`, `TORCH_CUDA_ARCH_LIST`, `FORCE_CUDA=1`.
-#
-# RoboStack publishes ROS 2 Humble as conda packages, which removes the premise.
-# The whole stack -- rclpy, cv_bridge, pytorch, and the detector -- now comes
-# from one solve, recorded in pixi.lock as the `ros` environment.  What goes
-# away with it:
-#
-#   * the CUDA toolkit apt install and the CUDA_HOME/LD_LIBRARY_PATH juggling;
-#     conda-forge's pytorch brings its own CUDA runtime, and only the host
-#     driver is needed (nvidia-container-toolkit)
-#   * `git clone --branch integration/split-fixes` of a GroundingDINO fork and
-#     the extension compile, replaced by groundingdino-py + groundingdino-py-cuda
-#   * the pip install of `.[docker]`; the `ros` environment already has it
-#   * the assertion that the installed groundingdino wins over ./groundingdino,
-#     which is now structurally true: nothing is installed into a dist-packages
-#     that the source tree could shadow
-#
-# One thing it costs: Python 3.12, not 3.10.  RoboStack has no 3.10 build of
-# humble for linux-64, so the `ros` environment pins 3.12 while the default
-# environment stays on 3.10.  See [tool.pixi.feature.ros] in pyproject.toml.
-#
-# Build with docker/build_ros2.sh -- it still stages trinity_msgs into the
-# context, which is the one thing that cannot come from a channel.
+# GroundingDINO ROS 2 image using the locked Pixi/RoboStack environment.
+# The ROS environment uses Python 3.12; see the ros feature in pyproject.toml.
+# Build with docker/build_ros2.sh so trinity_msgs is staged into the context.
 
 ARG PIXI_VERSION=0.77.0
 ARG UBUNTU_VERSION=24.04
 
 
-# ── build: solve the ros environment and compile the workspace ───────────────
+# Build the Pixi environment and ROS workspace.
 FROM ghcr.io/prefix-dev/pixi:${PIXI_VERSION}-noble AS build
 
-# /app/GroundingDINO, not /app: the ROS parameter defaults, the compose mounts,
-# check_perception_output.sh, QUICKSTART.md and DEMO.md all name this path.
-# Moving it is a separate change from swapping the build out.
+# Keep the project at the path expected by ROS parameters and compose mounts.
 WORKDIR /app/GroundingDINO
 
-# cython_bbox is an sdist and compiles a C extension on install.  Nothing else
-# here needs a compiler -- the ROS packages and the detector arrive built.
+# build-essential is needed for cython_bbox; git is needed for the CLIP dependency.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml pixi.lock README.md LICENSE ./
@@ -55,88 +26,105 @@ COPY utils/ ./utils/
 # No trailing slash: `helper` is a file, not a directory.
 COPY helper ./helper
 
-# The build host has no GPU, so the __cuda virtual package is absent and the
-# solve would fail on the workspace's `cuda = "12.9"`.  This asserts what the
-# deployment host provides; the container still needs a real driver at run time.
+# Allow the CUDA environment to resolve on build hosts without a GPU.
 ARG CONDA_OVERRIDE_CUDA=12.9
 ENV CONDA_OVERRIDE_CUDA=${CONDA_OVERRIDE_CUDA}
 
 RUN pixi install --locked --environment ros
 
-# GroundingDINO builds a bert-base-uncased text encoder, which transformers
-# otherwise fetches from HuggingFace on every cold container -- inside the first
-# callback's latency, and not at all on an air-gapped robot.
+# Cache the BERT model in the image and allow runtime lock files in the cache.
 ENV HF_HOME=/opt/hf-cache
 RUN pixi run --locked --environment ros python -c "\
 from transformers import AutoTokenizer, BertModel; \
 AutoTokenizer.from_pretrained('bert-base-uncased'); \
-BertModel.from_pretrained('bert-base-uncased')"
+BertModel.from_pretrained('bert-base-uncased')" \
+    && chmod -R a+rwX /opt/hf-cache
 
-# Activation for the `ros` environment.  This is what replaces
-# `source /opt/ros/humble/setup.bash`: RoboStack ships ROS's environment as
-# conda activation scripts, so activating the environment sets AMENT_PREFIX_PATH,
-# ROS_DISTRO, RMW_IMPLEMENTATION and the rest.
+# Generate the activation script used by the runtime image.
 RUN pixi shell-hook --locked --environment ros -s bash > /shell-hook.sh
 
 COPY . /app/GroundingDINO
 
-# ── the ROS workspace ────────────────────────────────────────────────────────
-# trinity_msgs is staged into the build context by docker/build_ros2.sh, which
-# pins the revision the running stack uses -- ROS 2 silently refuses to connect
-# publishers and subscribers whose type definitions differ, so this must match
-# rather than track HEAD.
+# Build the ROS workspace with the staged trinity_msgs definitions.
 COPY ros2_package/groundingdino_ros /app/ros2_ws/src/groundingdino_ros
 COPY _trinity_msgs_build /app/ros2_ws/src/trinity_msgs
 
-# colcon, ament and the rosidl generators come from the environment now, not
-# from apt.  --symlink-install is dropped: it points the install tree back at
-# /app/ros2_ws/src, and this stage's filesystem is not what ends up in the
-# runtime image.
+# Disable nounset while sourcing RoboStack activation scripts.
+# Tests are disabled because the runtime environment does not include ROS lint packages.
 RUN bash -c 'set -euo pipefail; \
-    source /shell-hook.sh; \
+    set +u; source /shell-hook.sh; set -u; \
     cd /app/ros2_ws; \
-    colcon build --packages-select trinity_msgs groundingdino_ros'
+    colcon build --packages-select trinity_msgs groundingdino_ros \
+        --cmake-args -DBUILD_TESTING=OFF'
+
+# Ensure ROS package files are readable and executable regardless of host modes.
+RUN chmod -R a+rX /app/ros2_ws /app/GroundingDINO/docker /app/GroundingDINO/ros2_package
 
 
-# ── runtime ──────────────────────────────────────────────────────────────────
+# Runtime image.
 FROM ubuntu:${UBUNTU_VERSION} AS runtime
 
-# The pixi environment carries its own libGL, libEGL and glib, so the usual
-# apt incantation for opencv is not needed.  ca-certificates only.
+# Run as a non-root user so bind-mounted output has predictable ownership.
+# USER_UID and USER_GID can be overridden at build time.
+ARG USER_NAME=dino
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+# Native runtime libraries are provided by the Pixi environment.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /app /app
+# Ubuntu 24.04 may already have a user with the requested UID.
+RUN if getent passwd ${USER_UID} >/dev/null; then \
+        userdel --remove "$(getent passwd ${USER_UID} | cut -d: -f1)"; \
+    fi; \
+    getent group ${USER_GID} >/dev/null || groupadd --gid ${USER_GID} ${USER_NAME}; \
+    useradd --uid ${USER_UID} --gid ${USER_GID} --create-home \
+            --shell /bin/bash ${USER_NAME}
+
+# Set ownership while copying to avoid an additional chown layer.
+COPY --from=build --chown=${USER_UID}:${USER_GID} /app /app
 COPY --from=build /shell-hook.sh /shell-hook.sh
-COPY --from=build /opt/hf-cache /opt/hf-cache
+COPY --from=build --chown=${USER_UID}:${USER_GID} /opt/hf-cache /opt/hf-cache
 
 RUN chmod +x /app/GroundingDINO/docker/ros2_entrypoint.sh
 
+ENV HOME=/home/${USER_NAME}
+
+# Use the baked Hugging Face cache and a per-user Torch cache.
 ENV HF_HOME=/opt/hf-cache \
+    TORCH_HOME=${HOME}/.cache/torch \
     PYTHONUNBUFFERED=1 \
     ROS2_WS=/app/ros2_ws \
     GROUNDINGDINO_PATH=/app/GroundingDINO \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# eval/ holds worker_simple and scene_graph, which the node imports directly.
-# The project itself is an editable install in the environment, so only these
-# paths have to be added by hand.  Same value the old image exported.
+# Add project modules imported directly by the ROS node.
 ENV PYTHONPATH=/app/GroundingDINO:/app/GroundingDINO/eval
 
-# ROS_DOMAIN_ID is left unset so `docker run -e ROS_DOMAIN_ID=...` decides; the
-# compose file sets it.
+# ROS_DOMAIN_ID is supplied by the runtime environment or compose configuration.
 
-# For `docker exec <container> bash`, which gets no ENTRYPOINT.  The CUDA_HOME
-# and LD_LIBRARY_PATH exports the old image wrote here are gone with the toolkit.
+# Make the Pixi and ROS environments available to shells started with docker exec.
+# profile.d also covers non-interactive login shells.
 RUN printf '%s\n' \
-    'source /shell-hook.sh' \
-    'source /app/ros2_ws/install/setup.bash' \
-    >> /root/.bashrc
+      'source /shell-hook.sh' \
+      'if [ -f /app/ros2_ws/install/setup.bash ]; then source /app/ros2_ws/install/setup.bash; fi' \
+      > /etc/profile.d/ros2_env.sh && \
+    chmod 0644 /etc/profile.d/ros2_env.sh && \
+    echo '. /etc/profile.d/ros2_env.sh' >> /root/.bashrc && \
+    echo '. /etc/profile.d/ros2_env.sh' >> ${HOME}/.bashrc
+
+# Keep HOME and /output writable when the container is started with an arbitrary UID.
+RUN mkdir -p ${HOME}/.ros/log ${TORCH_HOME} /output && \
+    chmod -R 0777 ${HOME} /output
 
 WORKDIR /app/GroundingDINO
 EXPOSE 7400-7500/udp
+
+# Run the application as the non-root container user.
+USER ${USER_NAME}
 
 ENTRYPOINT ["/app/GroundingDINO/docker/ros2_entrypoint.sh"]
 CMD ["ros2", "launch", "groundingdino_ros", "groundingdino.launch.py"]

@@ -22,8 +22,8 @@ Three pieces, matching the three steps:
      every track is tagged ``'target_candidate'`` or ``'anchor'``.  The role
      rides through to the graph node so the scorer knows what it is looking at.
   3. ``score_candidates`` — the soft subgraph scorer that replaces the hard
-     filter.  STUBBED this week (see its docstring); the point of Week 3 is that
-     the anchor is in the graph and scoring runs over all candidates.
+     filter: every candidate is ranked by detector confidence plus its weighted
+     match against the queried relation, and nothing is dropped.
 
 Role contract — anchors are scaffolding, never results
 ------------------------------------------------------
@@ -300,6 +300,51 @@ def anchor_tracks(tracks: Sequence, roles: Optional[Dict[int, str]]) -> List:
 # STEP 3 — soft subgraph scorer  (STUB — Week 4 finishes this)
 # ---------------------------------------------------------------------------
 
+#: Query relation name (snake_case) -> the scene-graph edge label (hyphenated)
+#: that means the same thing.  A relation absent from this table has no
+#: scene-graph equivalent yet and scores 0.0 rather than guessing: 'between'
+#: needs two anchors, and the temporal relations need a cross-frame comparison
+#: the per-frame graph does not carry.
+_EDGE_FOR_RELATION = {
+    "behind":      "behind",
+    "in_front_of": "in-front-of",
+    "left_of":     "left-of",
+    "right_of":    "right-of",
+    "next_to":     "near",
+}
+
+#: Edge labels that are only meaningful in the frame they were computed in.
+#: ``_depth_relation`` measures depth along the REFERENCE object's own heading,
+#: so "the bus is in front of the car, in the car's frame" implies nothing about
+#: where the car is relative to the bus — the two face different ways.  These
+#: labels are therefore dropped rather than inverted when an edge is read
+#: backwards.  ``SceneGraphBuilder`` orients anchor-spanning edges
+#: candidate -> anchor precisely so this case does not arise for the edges the
+#: scorer cares about; the guard is here so a future caller cannot reintroduce
+#: it silently.
+_FRAME_DEPENDENT_EDGES = frozenset({"behind", "in-front-of"})
+
+#: Every edge label the builder emits, mapped to the label that means the same
+#: thing with subject and object swapped.  Edges are stored once per pair, so an
+#: edge stored the other way round has to be read backwards.  Complete on
+#: purpose — a passthrough default would silently invert an asymmetric label
+#: into itself.
+_EDGE_INVERSE = {
+    "behind":           "in-front-of",
+    "in-front-of":      "behind",
+    "left-of":          "right-of",
+    "right-of":         "left-of",
+    "above":            "below",
+    "below":            "above",
+    "larger-than":      "smaller-than",
+    "smaller-than":     "larger-than",
+    "near":             "near",
+    "far":              "far",
+    "overlapping":      "overlapping",
+    "visually-similar": "visually-similar",
+}
+
+
 def score_candidates(
     frame_graph: Dict[str, Any],
     query,
@@ -317,22 +362,11 @@ def score_candidates(
 
     against the scene graph's nodes and edges for this frame.
 
-    STATUS: STUB.  The appearance term is the detector confidence and the
-    relation term is hard-zero, so today this returns detector confidence for
-    every candidate.  The structure — not the number — is the Week 3 deliverable:
-    the anchor is in the graph, and scoring runs over all candidates rather than
-    over post-filter survivors.
-
-    TODO(Week 4): implement ``_relation_term``.  For each candidate node, find
-    the anchor nodes in ``frame_graph['nodes']`` with ``role == ROLE_ANCHOR``,
-    look up the edge between them in ``frame_graph['edges']``, and turn the
-    edge's relation labels into a match score for ``query.relation['name']``.
-    The scene-graph edge labels are hyphenated ('left-of') while the query
-    vocabulary is snake_case ('left_of'); ``RelationSpec.scene_graph_hint``
-    records the mapping where one exists.  Ego-relative relations
-    (``counter_direction``, ``same_direction``) and any relation flagged in
-    ``query.notes`` must stay at 0.0 — they cannot be scored without a reference
-    heading the GT does not carry.
+    ``appearance_term + weight * relation_term``, where the appearance term is
+    the detector confidence and the relation term is the candidate's match
+    against ``query.relation`` on its edge to the anchor (see
+    ``_relation_term``).  The weight is the parsed relation weight: a multiplier
+    on the ranking, never a filter.
 
     Args:
         frame_graph:     a frame dict from ``SceneGraphBuilder.update()``.
@@ -356,20 +390,152 @@ def score_candidates(
         appearance_term = float(node.get("confidence", 0.0))
         relation_term = _relation_term(node, frame_graph, query)
 
-        # This is where the parsed relation weight plugs in.  Week 4 turns
-        # relation_term into a real [0, 1] match score; until then it is 0.0 and
-        # the product contributes nothing.
+        # The parsed relation weight plugs in here.  relation_term is in
+        # [0, 1], so a candidate that satisfies the relation is lifted by at
+        # most `weight` above one that does not — enough to reorder a ranking
+        # that detector confidence alone gets backwards, without ever dropping
+        # a candidate.
         scores[int(node["track_id"])] = appearance_term + weight * relation_term
 
     return scores
 
 
+def relation_holds(frame_graph: Dict[str, Any], query) -> Optional[set]:
+    """Track IDs whose edge to an anchor satisfies ``query.relation``.
+
+    Returns ``None`` — meaning "this relation cannot be judged at all" — rather
+    than an empty set when there is nothing to judge with: a plain prompt, an
+    ego-anchored or unary relation, a relation with no scene-graph equivalent,
+    or a frame where the anchor was not detected.  The distinction matters at
+    the call site: an empty set is a real answer ("nothing is behind the bus"),
+    while ``None`` means the relation layer has no opinion and must not be
+    allowed to silence the output.
+    """
+    if query.relation is None or query.anchor is None:
+        return None
+    if _EDGE_FOR_RELATION.get(query.relation["name"]) is None:
+        return None
+    if not any(n.get("role") == ROLE_ANCHOR for n in frame_graph.get("nodes", [])):
+        return None
+
+    return {
+        int(n["track_id"])
+        for n in frame_graph.get("nodes", [])
+        if n.get("role", ROLE_TARGET) == ROLE_TARGET
+        and _relation_term(n, frame_graph, query) > 0.0
+    }
+
+
+def select_answers(
+    candidates: Sequence,
+    frame_graph: Dict[str, Any],
+    query,
+    scores: Optional[Dict[int, float]] = None,
+) -> List:
+    """Which of the emitted candidates actually answer the prompt.
+
+    A **threshold, not an argmax.**  "cars behind the bus" is plural and must be
+    able to return several; "the red car behind the bus" happens to return one
+    because only one satisfies the relation, not because the policy picked a
+    winner.  Taking the top-scoring candidate would collapse the first case and
+    make the second right for the wrong reason.
+
+    The policy, in order:
+
+    1. If the relation cannot be judged (``relation_holds`` returns ``None``),
+       every candidate is returned unchanged.  Grounding must never silence the
+       output for a prompt the relation layer has no opinion about — that would
+       turn a missing feature into a confident empty answer.
+    2. Otherwise keep the candidates the relation held for.  This can legitimately
+       be empty: "nothing in this frame is behind the bus" is an answer.
+    3. If the prompt named a cardinality (``"the two cars behind the bus"`` ->
+       ``count=2``) and more survived than that, keep the highest-scoring
+       ``count``.  ``scores`` is required for this step; without it the
+       cardinality is left unenforced rather than applied arbitrarily.
+
+    Note ``count`` is only set when the prompt states a number.  Bare singular
+    and plural both parse to ``None`` ("red car behind the bus" and "cars behind
+    the bus" are indistinguishable to the parser today), so nothing here tries
+    to infer arity from grammatical number.
+
+    Args:
+        candidates:  already through ``emitted_tracks`` — anchors are gone.
+        frame_graph: the frame dict the candidates were scored against.
+        query:       the ``Query`` this frame was detected for.
+        scores:      ``{track_id: weight}`` from ``score_candidates``; needed
+                     only to enforce an explicit count.
+    """
+    holds = relation_holds(frame_graph, query)
+    if holds is None:
+        return list(candidates)
+
+    selected = [t for t in candidates if int(t.track_id) in holds]
+
+    count = ((query.target or {}).get("attrs") or {}).get("count")
+    if count and scores is not None and len(selected) > count:
+        selected = sorted(
+            selected, key=lambda t: scores.get(int(t.track_id), 0.0), reverse=True
+        )[:count]
+
+    return selected
+
+
 def _relation_term(node: Dict[str, Any], frame_graph: Dict[str, Any], query) -> float:
     """How well this candidate's edge to the anchor matches ``query.relation``.
 
-    STUB — always 0.0.  See the TODO in ``score_candidates`` for what Week 4
-    fills in here.  Signature is fixed now so the call site does not move.
+    1.0 when the graph put the queried relation on an edge between this
+    candidate and **any** anchor node, 0.0 otherwise.  Binary because the graph
+    hands back labels, not margins — there is no partial "somewhat behind" to
+    report, and inventing one would put a number on the output that no stage
+    measured.  With several anchors detected (two buses in frame), satisfying the
+    relation against one of them is enough: "behind the bus" does not say which.
+
+    Returns 0.0, without consulting the graph, whenever the relation cannot be
+    scored at all:
+
+    * no relation, or ``query.anchor is None``.  That single check covers every
+      ego case — the parser sets ``anchor=None`` both for the unary
+      ego-relative relations (``counter_direction``, ``same_direction``) and for
+      a binary relation anchored on the ego vehicle ("cars approaching us").
+      Ego is not a tracked node, so there is no edge to look up and no reference
+      heading to substitute for one.
+    * a relation with no scene-graph equivalent — see ``_EDGE_FOR_RELATION``.
+    * no anchor node in this frame (the anchor was not detected here).
     """
+    if query.relation is None or query.anchor is None:
+        return 0.0
+
+    edge_label = _EDGE_FOR_RELATION.get(query.relation["name"])
+    if edge_label is None:
+        return 0.0
+
+    anchors = {
+        int(n["track_id"])
+        for n in frame_graph.get("nodes", [])
+        if n.get("role") == ROLE_ANCHOR
+    }
+    if not anchors:
+        return 0.0
+
+    track_id = int(node["track_id"])
+    for edge in frame_graph.get("edges", []):
+        source, target = int(edge["source"]), int(edge["target"])
+        if source == track_id and target in anchors:
+            labels = edge.get("relations") or []
+        elif target == track_id and source in anchors:
+            # Stored anchor -> candidate; read it backwards so it means the same
+            # thing in the direction the query is written.  Frame-dependent
+            # labels cannot survive that and are dropped, not inverted.
+            labels = [
+                _EDGE_INVERSE[r]
+                for r in (edge.get("relations") or [])
+                if r not in _FRAME_DEPENDENT_EDGES
+            ]
+        else:
+            continue
+        if edge_label in labels:
+            return 1.0
+
     return 0.0
 
 
