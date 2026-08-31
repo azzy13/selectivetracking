@@ -482,15 +482,9 @@ def main():
     ap.add_argument(
         "--referring_mode",
         type=str,
-        choices=["none", "topk", "threshold"],
-        default="topk",
-        help="Referring filter mode: 'topk' (keep top-K per frame), 'threshold' (keep above similarity), or 'none' (disabled)",
-    )
-    ap.add_argument(
-        "--referring_topk",
-        type=int,
-        default=3,
-        help="Number of detections to keep per frame when referring_mode='topk' (default: 3)",
+        choices=["none", "threshold"],
+        default="threshold",
+        help="Referring filter mode: 'threshold' (keep above similarity) or 'none' (disabled)",
     )
     ap.add_argument(
         "--referring_thresh",
@@ -709,7 +703,6 @@ def main():
                 weights_path=args.weights,
                 device=device_str,
                 referring_mode=args.referring_mode,
-                referring_topk=args.referring_topk,
                 referring_thresh=args.referring_thresh,
                 use_spatial_filter=args.use_spatial_filter,
                 use_color_filter=args.use_color_filter,

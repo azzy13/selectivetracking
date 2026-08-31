@@ -130,8 +130,7 @@ class ReferringDetectionFilter:
         clip_model,
         clip_preprocess,
         text_embedding: torch.Tensor,
-        mode: str = "topk",
-        topk: int = 3,
+        mode: str = "threshold",
         threshold: float = 0.0,
         pad: int = 4,
         device: str = "cuda"
@@ -141,8 +140,7 @@ class ReferringDetectionFilter:
             clip_model: CLIP model (shared with tracker)
             clip_preprocess: CLIP preprocessing transform
             text_embedding: Pre-computed text embedding [D] for the expression
-            mode: "topk" (keep top-K), "threshold" (keep above thresh), or "none" (disabled)
-            topk: Number of detections to keep per frame (for mode="topk")
+            mode: "threshold" (keep above thresh) or "none" (disabled)
             threshold: Min CLIP similarity (for mode="threshold")
             pad: Padding around crops (pixels)
             device: Device for CLIP inference
@@ -151,7 +149,6 @@ class ReferringDetectionFilter:
         self.clip_preprocess = clip_preprocess
         self.text_embedding = text_embedding.to(device)
         self.mode = mode.lower()
-        self.topk = int(topk)
         self.threshold = float(threshold)
         self.pad = int(pad)
         self.device = device
@@ -180,11 +177,7 @@ class ReferringDetectionFilter:
         similarities = self._compute_similarities(frame_bgr, dets_xyxy)
 
         # Filter based on mode
-        if self.mode == "topk":
-            k = min(self.topk, len(dets_xyxy))
-            top_indices = np.argsort(similarities)[-k:][::-1]  # Top-K descending
-            filtered = dets_xyxy[top_indices]
-        elif self.mode == "threshold":
+        if self.mode == "threshold":
             keep_mask = similarities >= self.threshold
             filtered = dets_xyxy[keep_mask]
         else:
@@ -283,8 +276,7 @@ class Worker:
         tracker_kwargs: Optional[dict] = None,
 
         # Referring detection filter
-        referring_mode: str = "none",  # "topk", "threshold", or "none"
-        referring_topk: int = 3,
+        referring_mode: str = "none",  # "threshold" or "none"
         referring_thresh: float = 0.0,
 
         # Misc
@@ -368,12 +360,11 @@ class Worker:
                 clip_preprocess=self.clip_preprocess,
                 text_embedding=self.text_embedding,
                 mode=referring_mode,
-                topk=referring_topk,
                 threshold=referring_thresh,
                 pad=self.clip_pad,
                 device=self.device
             )
-            print(f"[Worker] Referring filter enabled: mode={referring_mode}, topk={referring_topk}, thresh={referring_thresh}")
+            print(f"[Worker] Referring filter enabled: mode={referring_mode}, thresh={referring_thresh}")
 
     @staticmethod
     def _build_tracker(tracker_type: str, tracker_args: argparse.Namespace, *, frame_rate: int):

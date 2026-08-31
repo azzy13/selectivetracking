@@ -32,6 +32,8 @@ import pandas as pd
 from groundingdino.util.inference import load_model, predict
 from demo.florence2_adapter import Florence2Detector
 from query_grounding import ROLE_TARGET
+import color_classifier
+import motion_classifier
 
 # ============================
 # Configuration Defaults
@@ -333,96 +335,17 @@ class ReferringDetectionFilter:
         return filtered
 
     def _get_patchwise_dominant_color(self, crop_rgb: np.ndarray, grid_size: int = 4):
+        """Dominant colour of a crop, by patch voting in CIELAB.
+
+        Delegates to ``color_classifier.patch_votes``.  The previous HSV rule
+        gated on ``S >= 35`` before ever testing brightness, and HSV saturation
+        is undefined as value goes to zero — so black cars were classified by
+        hue and never once came out ``'dark'``.  See ``eval/color_classifier.py``
+        for the measurement and the replacement.
+
+        Returns ``(dominant_label, {label: patch_count})``, unchanged.
         """
-        Detect dominant color from a crop using patch-based histogram voting.
-
-        Splits crop into grid_size x grid_size patches, computes dominant color
-        per patch via HSV analysis, then votes for overall dominant color.
-
-        Args:
-            crop_rgb: RGB image crop (H x W x 3)
-            grid_size: Number of patches per dimension (default 4x4 = 16 patches)
-
-        Returns:
-            Tuple of (dominant_color, votes_dict):
-                dominant_color: 'dark', 'light', 'gray', 'red', 'orange',
-                                'yellow', 'green', 'blue', or 'unknown'
-                votes_dict: dict mapping color name -> patch count
-
-        Note:
-            - Saturated pixels (S >= 35) classified by hue first (red/blue/etc)
-            - Achromatic pixels (S < 50) classified by brightness:
-              'dark' (V < 80), 'light' (V > 180), 'gray' (80-180)
-        """
-        # Convert to HSV for color analysis
-        hsv = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2HSV)
-        h, w = hsv.shape[:2]
-
-        # Handle very small crops
-        if h < grid_size or w < grid_size:
-            grid_size = min(h, w, 2)
-
-        patch_h = max(1, h // grid_size)
-        patch_w = max(1, w // grid_size)
-        color_votes = {}
-
-        def classify_pixel_color(hsv_pixel):
-            """Classify a single HSV pixel into a color category.
-
-            Checks saturation first: saturated pixels are classified by hue
-            (chromatic), regardless of brightness. Only low-saturation pixels
-            fall through to brightness-based (achromatic) classification.
-            This prevents bright/dark reds from being misclassified as
-            'light' or 'dark'.
-            """
-            h_val, s_val, v_val = hsv_pixel
-
-            # Chromatic colors: if saturation is high enough, classify by hue
-            # regardless of brightness. This correctly handles bright red,
-            # dark red, etc.
-            if s_val >= 35:
-                if h_val < 15 or h_val >= 160:
-                    return 'red'
-                elif 15 <= h_val < 25:
-                    return 'orange'
-                elif 25 <= h_val < 35:
-                    return 'yellow'
-                elif 35 <= h_val < 85:
-                    return 'green'
-                elif 85 <= h_val < 160:
-                    return 'blue'
-
-            # Achromatic: low saturation, classify by brightness
-            if v_val < 80:
-                return 'dark'
-            elif v_val > 180:
-                return 'light'
-            else:
-                return 'gray'
-
-        # Vote across patches
-        for i in range(grid_size):
-            for j in range(grid_size):
-                # Extract patch
-                y_start = i * patch_h
-                y_end = min((i + 1) * patch_h, h)
-                x_start = j * patch_w
-                x_end = min((j + 1) * patch_w, w)
-
-                patch = hsv[y_start:y_end, x_start:x_end]
-
-                # Compute mean HSV for this patch
-                if patch.size > 0:
-                    mean_pixel = np.mean(patch.reshape(-1, 3), axis=0)
-                    color = classify_pixel_color(mean_pixel)
-                    color_votes[color] = color_votes.get(color, 0) + 1
-
-        # Return dominant color AND votes dict
-        if not color_votes:
-            return 'unknown', {}
-
-        dominant = max(color_votes.items(), key=lambda x: x[1])[0]
-        return dominant, color_votes
+        return color_classifier.patch_votes(crop_rgb, grid_size=grid_size)
 
     def _compute_color_similarities(self, frame_bgr: np.ndarray, dets_xyxy: np.ndarray) -> np.ndarray:
         """
@@ -501,7 +424,7 @@ class ReferringDetectionFilter:
 
         return False
 
-    def _color_score_three_way(self, detected_color: str, target_color: str) -> float:
+    def _color_score_three_way(self, detected_color: str, target_color: str) -> float:  # noqa: D401
         """Three-outcome color scoring for post-track gating.
 
         Returns:
@@ -537,45 +460,24 @@ class ReferringDetectionFilter:
     }
 
     def _color_score_with_presence(self, votes: dict, target_color: str,
-                                    min_target_patches: int = 3) -> float:
-        """Score based on target color *presence* rather than dominance.
+                                   min_target_patches: int = 3,
+                                   crop_chroma: Optional[float] = None) -> float:
+        """Three-way colour score for one crop. Delegates to color_classifier.
 
-        From aerial views, windshield reflections (green/blue) can outvote the
-        actual car body paint. This method checks whether the target color has
-        enough patches to count as evidence, even if it's not the majority.
+        ``1.0`` supports the target · ``0.0`` is evidence against ·
+        ``0.5`` is uninformative.  Presence-based rather than dominance-based:
+        enough patches of the target colour count even when something else wins
+        the vote, because glass and reflections routinely outvote the paint.
 
-        Neighboring hues (e.g. orange for red) are counted as supporting
-        evidence because lighting and viewing angle shift perceived hue.
-
-        Returns:
-            1.0  if target color (incl. synonyms + neighbors) has >= min_target_patches
-            Otherwise falls back to three-way scoring on dominant color.
+        ``crop_chroma`` lets the classifier refuse a hue claim about an object
+        that is not chromatic at all — without it, a couple of noisy patches
+        assert "red" on a grey car.
         """
-        if not votes:
-            return 0.5
-
-        target_lc = target_color.lower()
-
-        # Count patches matching target color (including synonyms)
-        target_count = 0
-        for color, count in votes.items():
-            if self._match_color(color, target_lc):
-                target_count += count
-
-        if target_count >= min_target_patches:
-            return 1.0
-
-        # Also count neighboring hue patches as supporting evidence
-        neighbor_count = target_count
-        for neighbor in self._HUE_NEIGHBORS.get(target_lc, []):
-            neighbor_count += votes.get(neighbor, 0)
-
-        if neighbor_count >= min_target_patches:
-            return 1.0
-
-        # Fall back to standard three-way scoring
-        dominant = max(votes, key=votes.get)
-        return self._color_score_three_way(dominant, target_lc)
+        return color_classifier.score_votes(
+            votes, target_color,
+            min_target_patches=min_target_patches,
+            crop_chroma=crop_chroma,
+        )
 
     def get_stats(self) -> dict:
         """Return filtering statistics."""
@@ -638,27 +540,58 @@ class TrackColorGate:
     # aerial views (windshield reflections would otherwise dominate).
     COLOR_PAD_Y = 0.25
 
-    def _score_bbox(self, frame_bgr: np.ndarray, x: float, y: float,
-                    w: float, h: float) -> float:
-        """Compute three-outcome color score for a single tlwh bbox."""
-        H_img, W_img = frame_bgr.shape[:2]
+    def _crop_for_bbox(self, frame_bgr: np.ndarray, x: float, y: float,
+                       w: float, h: float) -> Optional[np.ndarray]:
+        """RGB crop for one tlwh box, vertically padded, or None if too small.
 
-        # Pad bbox vertically to capture more of the object body.
-        # Aerial/elevated cameras produce tight bboxes where windshield
-        # reflections dominate; padding recovers the actual paint area.
+        Aerial/elevated cameras produce tight bboxes where windshield
+        reflections dominate; padding downward recovers the actual paint area.
+        """
+        H_img, W_img = frame_bgr.shape[:2]
         pad_y = int(h * self.COLOR_PAD_Y)
         xi1 = max(0, int(x))
-        yi1 = max(0, int(y) - pad_y // 3)       # small upward
+        yi1 = max(0, int(y) - pad_y // 3)        # small upward
         xi2 = min(W_img, int(x + w))
         yi2 = min(H_img, int(y + h) + pad_y)     # larger downward
 
         if xi2 <= xi1 or yi2 <= yi1 or (xi2 - xi1) < 10 or (yi2 - yi1) < 10:
-            return 0.5  # too small → uninformative
+            return None
+        return cv2.cvtColor(frame_bgr[yi1:yi2, xi1:xi2], cv2.COLOR_BGR2RGB)
 
-        crop_rgb = cv2.cvtColor(frame_bgr[yi1:yi2, xi1:xi2], cv2.COLOR_BGR2RGB)
-        _, votes = self.color_filter._get_patchwise_dominant_color(crop_rgb, grid_size=4)
-        return self.color_filter._color_score_with_presence(
-            votes, self.target_color, min_target_patches=3)
+    def _score_bbox(self, frame_bgr: np.ndarray, x: float, y: float,
+                    w: float, h: float) -> float:
+        """Three-outcome colour score for a single tlwh bbox, no peer context."""
+        crop = self._crop_for_bbox(frame_bgr, x, y, w, h)
+        if crop is None:
+            return 0.5  # too small -> uninformative
+        return color_classifier.score_crop(crop, self.target_color)
+
+    def _score_tracks(self, tracks: list, frame_bgr: np.ndarray) -> Dict[int, float]:
+        """Score every track in the frame *against each other*.
+
+        For an achromatic target ("black", "silver", "light") the decision is
+        made on where each track's lightness ranks among the other tracks in
+        the same frame rather than against a fixed L* cut, which is what keeps
+        it from carrying one dataset's exposure into another.  Scoring the
+        tracks one at a time would throw that context away, so they are scored
+        together here.  See ``eval/color_classifier.py``.
+        """
+        crops: Dict[int, np.ndarray] = {}
+        for t in tracks:
+            x, y, w, h = t.tlwh
+            if w * h < 10:
+                continue
+            crop = self._crop_for_bbox(frame_bgr, x, y, w, h)
+            if crop is not None:
+                crops[t.track_id] = crop
+
+        if not crops:
+            return {}
+
+        ids = list(crops)
+        scores = color_classifier.peer_relative_scores(
+            [crops[i] for i in ids], self.target_color)
+        return dict(zip(ids, scores))
 
     def update(self, tracks: list, frame_bgr: np.ndarray,
                verbose: bool = False) -> list:
@@ -670,6 +603,9 @@ class TrackColorGate:
         active_ids = set()
         confirmed = []
 
+        # Scored as a group: peer-relative lightness needs the whole frame.
+        frame_scores = self._score_tracks(tracks, frame_bgr)
+
         for t in tracks:
             tid = t.track_id
             active_ids.add(tid)
@@ -678,7 +614,7 @@ class TrackColorGate:
                 continue
 
             state = self._get_or_init(tid)
-            score = self._score_bbox(frame_bgr, x, y, w, h)
+            score = frame_scores.get(tid, 0.5)
 
             # EMA — skip unknown (0.5) so shadows don't drag confidence down
             if score != 0.5:
@@ -742,6 +678,91 @@ class TrackColorGate:
 # ============================
 # Worker Class
 # ============================
+class TrackMotionGate:
+    """Post-track gate for motion prompts ("moving cars", "parked cars").
+
+    Mirrors TrackColorGate's hysteresis, but the underlying cue is much weaker
+    and the reason is structural: Refer-KITTI is filmed from a moving car, so
+    image-space displacement measures ego-motion.  ``motion_classifier`` fits and
+    subtracts a radial ego-flow field to recover independent motion, which takes
+    the signal from AUC 0.498 (none) to 0.631 — real, but far below the spatial
+    (0.95-0.97) and colour (0.71-0.86) cues in the same pipeline.
+
+    Because of that this gate is **off by default**.  Its balanced accuracy on
+    ground-truth boxes is 0.589 for "moving" and 0.552 for "stationary", so on
+    real tracks it deletes close to as many targets as distractors.  Enable with
+    ``--use_motion_filter`` and check ``eval/check_motion_classifier.py`` first.
+    """
+
+    CONFIRM_COUNT = 3
+    WINDOW_SIZE = 5
+    FAIL_STREAK_TO_DROP = 6      # one longer than the colour gate: weaker cue
+
+    def __init__(self, target_state: str):
+        self.target_state = target_state
+        self.scorer = motion_classifier.MotionScorer(target_state)
+        self._state: Dict[int, dict] = {}
+        self.total_tracks_in = 0
+        self.total_tracks_out = 0
+
+    def _get_or_init(self, track_id: int) -> dict:
+        if track_id not in self._state:
+            self._state[track_id] = {
+                "recent": deque(maxlen=self.WINDOW_SIZE),
+                "fail_streak": 0,
+                # Confirmed on arrival: the cue needs several frames of history
+                # before it says anything, and dropping every track for the
+                # first few frames would cost more than the gate ever recovers.
+                "confirmed": True,
+            }
+        return self._state[track_id]
+
+    def update(self, tracks: list, frame_id: int, img_w: int, img_h: int,
+               verbose: bool = False) -> list:
+        if self.target_state not in ("moving", "stationary"):
+            return tracks
+
+        self.total_tracks_in += len(tracks)
+        scores = self.scorer.score_frame(frame_id, tracks, img_w, img_h)
+
+        kept = []
+        for t in tracks:
+            st = self._get_or_init(t.track_id)
+            score = scores.get(t.track_id, 0.5)
+            st["recent"].append(score)
+
+            if score == 0.0:
+                st["fail_streak"] += 1
+            elif score == 1.0:
+                st["fail_streak"] = 0
+
+            if st["confirmed"]:
+                if st["fail_streak"] >= self.FAIL_STREAK_TO_DROP:
+                    st["confirmed"] = False
+            else:
+                if sum(1 for v in st["recent"] if v == 1.0) >= self.CONFIRM_COUNT:
+                    st["confirmed"] = True
+                    st["fail_streak"] = 0
+
+            if st["confirmed"]:
+                kept.append(t)
+
+        self.total_tracks_out += len(kept)
+        if verbose:
+            print(f"    [MotionGate] {len(kept)}/{len(tracks)} kept "
+                  f"(target={self.target_state})")
+        return kept
+
+    def get_stats(self) -> dict:
+        return {
+            "target_state": self.target_state,
+            "total_in": self.total_tracks_in,
+            "total_out": self.total_tracks_out,
+            "retention_rate": (self.total_tracks_out / self.total_tracks_in
+                               if self.total_tracks_in else 0.0),
+        }
+
+
 class Worker:
     """
     GroundingDINO + Tracker evaluation worker.
@@ -770,6 +791,10 @@ class Worker:
         referring_thresh: float = 0.25,
         use_spatial_filter: bool = True,
         use_color_filter: bool = True,
+        # Motion prompts.  Off by default: the cue is weak on a moving camera
+        # (see TrackMotionGate) and a gate that deletes as many targets as
+        # distractors is worse than no gate.
+        use_motion_filter: bool = False,
         # Query grounding (Week 3) — see query_grounding.py
         query=None,                          # a query_parser.Query, or None
         debug_draw_anchors: bool = False,    # dotted anchor boxes in debug video
@@ -853,6 +878,9 @@ class Worker:
         )
         self.tracker = self._build_tracker(tracker_type, tracker_args, frame_rate=self.frame_rate)
         self.tracker_type = tracker_type
+        # Kept so a sequence boundary can rebuild the tracker from scratch —
+        # see reset_sequence_state().
+        self._tracker_args = tracker_args
 
         # CLIP setup
         self.class_names = [c.strip() for c in self.text_prompt.split(".") if c.strip()] or ["object"]
@@ -907,6 +935,17 @@ class Worker:
             print(f"[Worker] Post-track color gate: target={self.color_gate.target_color}, "
                   f"confirm={TrackColorGate.CONFIRM_COUNT}/{TrackColorGate.WINDOW_SIZE} frames, "
                   f"exit_streak={TrackColorGate.FAIL_STREAK_TO_DROP}")
+
+        # Post-track motion gate
+        self.motion_gate = None
+        motion_state = motion_classifier.canonical_motion(self.text_prompt)
+        if use_motion_filter and motion_state in ("moving", "stationary"):
+            self.motion_gate = TrackMotionGate(motion_state)
+            print(f"[Worker] Post-track motion gate: target={motion_state} "
+                  f"(weak cue — see check_motion_classifier.py)")
+        elif use_motion_filter and motion_state == "unscoreable":
+            print(f"[Worker] Motion prompt detected but not scoreable from a "
+                  f"monocular dashcam track; no motion gate applied.")
 
     @staticmethod
     def _build_tracker(tracker_type: str, tracker_args: argparse.Namespace, *, frame_rate: int):
@@ -1132,6 +1171,29 @@ class Worker:
         """Write MOTChallenge format line."""
         fh.write(f"{frame_id},{track_id},{x:.2f},{y:.2f},{w:.2f},{h:.2f},1,-1,-1,-1\n")
 
+    def reset_sequence_state(self) -> None:
+        """Drop everything that is scoped to one sequence.
+
+        The tracker is built once in ``__init__`` and carries track ids,
+        buffers and Kalman state.  Two sequences processed by the same Worker
+        are independent scenes, so without this the second inherits the first's
+        tracks — ids continue climbing, and a coasting track from the end of
+        one clip can be matched to a detection at the start of the next.
+
+        Called automatically at the top of ``process_sequence``.  Every caller
+        today builds a fresh Worker per sequence, so this changes no existing
+        result; it makes Worker reuse safe, which matters when the per-sequence
+        model load (~5.5 s) dominates a many-clip sweep.
+        """
+        self.tracker = self._build_tracker(
+            self.tracker_type, self._tracker_args, frame_rate=self.frame_rate)
+        self._track_roles = {}
+        if getattr(self, "color_gate", None) is not None:
+            self.color_gate._state = {}
+        if getattr(self, "motion_gate", None) is not None:
+            self.motion_gate._state = {}
+            self.motion_gate.scorer.reset()
+
     def process_sequence(
         self,
         *,
@@ -1154,6 +1216,8 @@ class Worker:
             sort_frames: Whether to sort frames by ID
             video_out_path: Optional video output path
         """
+        self.reset_sequence_state()
+
         seq_path = os.path.join(img_folder, seq)
         if not os.path.isdir(seq_path):
             raise FileNotFoundError(f"Sequence path not found: {seq_path}")
@@ -1251,6 +1315,14 @@ class Worker:
                     tracks = self.color_gate.update(tracks, img, verbose=show_detail)
                     if show_detail:
                         print(f" → color={len(tracks)}", end="")
+
+                # Post-track motion gate
+                if self.motion_gate is not None:
+                    tracks = self.motion_gate.update(tracks, frame_id,
+                                                     orig_w, orig_h,
+                                                     verbose=show_detail)
+                    if show_detail:
+                        print(f" → motion={len(tracks)}", end="")
 
                 # Roles: detection -> track, so the graph knows what each node is.
                 track_roles = None
