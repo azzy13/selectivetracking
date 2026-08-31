@@ -1,203 +1,130 @@
-# Multi-stage Dockerfile for GroundingDINO ROS2 integration
-# Base: ROS2 Humble + CUDA for GPU acceleration
+# syntax=docker/dockerfile:1
+#
+# GroundingDINO ROS 2 image using the locked Pixi/RoboStack environment.
+# The ROS environment uses Python 3.12; see the ros feature in pyproject.toml.
+# Build with docker/build_ros2.sh so trinity_msgs is staged into the context.
 
-# Stage 1: Base ROS2 + CUDA environment
-FROM ros:humble-ros-base
+ARG PIXI_VERSION=0.77.0
+ARG UBUNTU_VERSION=24.04
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV ROS_DISTRO=humble
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    python3-pip \
-    python3-dev \
-    git \
-    build-essential \
-    cmake \
-    ninja-build \
-    wget \
-    curl \
-    gnupg2 \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Build the Pixi environment and ROS workspace.
+FROM ghcr.io/prefix-dev/pixi:${PIXI_VERSION}-noble AS build
 
-# Install CUDA Toolkit 11.8 (required for compiling GroundingDINO extensions)
-RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb && \
-    dpkg -i cuda-keyring_1.0-1_all.deb && \
-    rm cuda-keyring_1.0-1_all.deb && \
-    apt-get update && \
-    apt-get install -y cuda-toolkit-11-8 && \
-    rm -rf /var/lib/apt/lists/*
-
-# Set CUDA environment variables
-ENV CUDA_HOME=/usr/local/cuda-11.8
-ENV PATH=${CUDA_HOME}/bin:${PATH}
-ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:/usr/local/lib/python3.10/dist-packages/torch/lib:${LD_LIBRARY_PATH}
-
-# Install ROS2 dependencies
-RUN apt-get update && apt-get install -y \
-    ros-${ROS_DISTRO}-cv-bridge \
-    ros-${ROS_DISTRO}-vision-msgs \
-    python3-colcon-common-extensions \
-    && rm -rf /var/lib/apt/lists/*
-
-# Stage 2: Install GroundingDINO and dependencies
-WORKDIR /app
-
-# Copy GroundingDINO source (excluding weights)
-COPY . /app/GroundingDINO/
+# Keep the project at the path expected by ROS parameters and compose mounts.
 WORKDIR /app/GroundingDINO
 
-# Install Python dependencies
-# First install Cython (required for cython_bbox)
-RUN pip3 install --no-cache-dir Cython
+# build-essential is needed for cython_bbox; git is needed for the CLIP dependency.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential git \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install PyTorch with CUDA 11.8 support
-RUN pip3 install --no-cache-dir \
-    torch==2.1.2 torchvision --index-url https://download.pytorch.org/whl/cu118
+COPY pyproject.toml pixi.lock README.md LICENSE ./
+COPY eval/ ./eval/
+COPY tracker/ ./tracker/
+COPY utils/ ./utils/
+# No trailing slash: `helper` is a file, not a directory.
+COPY helper ./helper
 
-# Update LD_LIBRARY_PATH to include PyTorch libs (needed for CUDA extensions)
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/torch/lib:${LD_LIBRARY_PATH}
+# Allow the CUDA environment to resolve on build hosts without a GPU.
+ARG CONDA_OVERRIDE_CUDA=12.9
+ENV CONDA_OVERRIDE_CUDA=${CONDA_OVERRIDE_CUDA}
 
-# Install remaining dependencies from requirements.txt
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pixi install --locked --environment ros
 
+# Cache the BERT model in the image and allow runtime lock files in the cache.
+ENV HF_HOME=/opt/hf-cache
+RUN pixi run --locked --environment ros python -c "\
+from transformers import AutoTokenizer, BertModel; \
+AutoTokenizer.from_pretrained('bert-base-uncased'); \
+BertModel.from_pretrained('bert-base-uncased')" \
+    && chmod -R a+rwX /opt/hf-cache
 
-# Build GroundingDINO - Force clean build to ensure CUDA extensions compile
-# Set TORCH_CUDA_ARCH_LIST to force CUDA compilation even without GPU during build
-ENV TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX"
-RUN rm -rf build/ dist/ *.egg-info groundingdino/_C.*.so && \
-    python3 setup.py clean --all && \
-    FORCE_CUDA=1 pip3 install -v --no-build-isolation -e .
+# Generate the activation script used by the runtime image.
+RUN pixi shell-hook --locked --environment ros -s bash > /shell-hook.sh
 
-# Install MoGe-2 depth model and its non-PyPI dependencies
-# pipeline, utils3d, and moge all use vcs-versioning — without full git history in Docker
-# they resolve to UNKNOWN-0.0.0 and pip skips subsequent installs thinking the package
-# is already present. Workaround: clone each repo and copy the module directory directly.
+COPY . /app/GroundingDINO
 
-# PyPI deps for moge/utils3d that are safe to install normally
-RUN pip3 install --no-cache-dir trimesh huggingface_hub moderngl
-
-RUN git clone https://github.com/EasternJournalist/pipeline.git /tmp/pipeline_src && \
-    cd /tmp/pipeline_src && git checkout 866f059d2a05cde05e4a52211ec5051fd5f276d6 && \
-    cp -r pipeline /usr/local/lib/python3.10/dist-packages/ && \
-    rm -rf /tmp/pipeline_src
-
-RUN git clone https://github.com/EasternJournalist/utils3d.git /tmp/utils3d_src && \
-    cd /tmp/utils3d_src && git checkout 3fab839f0be9931dac7c8488eb0e1600c236e183 && \
-    cp -r utils3d /usr/local/lib/python3.10/dist-packages/ && \
-    rm -rf /tmp/utils3d_src
-
-RUN git clone https://github.com/microsoft/MoGe.git /tmp/moge_src && \
-    cd /tmp/moge_src && git checkout 07444410f1e33f402353b99d6ccd26bd31e469e8 && \
-    cp -r moge /usr/local/lib/python3.10/dist-packages/ && \
-    rm -rf /tmp/moge_src
-
-# Stage 3: Build ROS2 workspace
-WORKDIR /app/ros2_ws
-
-# Copy ROS2 packages (trinity_msgs staged by build_ros2.sh into _trinity_msgs_build/)
+# Build the ROS workspace with the staged trinity_msgs definitions.
 COPY ros2_package/groundingdino_ros /app/ros2_ws/src/groundingdino_ros
 COPY _trinity_msgs_build /app/ros2_ws/src/trinity_msgs
 
-# Build trinity_msgs first (groundingdino_ros depends on it)
-RUN /bin/bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && \
-    colcon build --packages-select trinity_msgs groundingdino_ros --symlink-install"
+# Disable nounset while sourcing RoboStack activation scripts.
+# Tests are disabled because the runtime environment does not include ROS lint packages.
+RUN bash -c 'set -euo pipefail; \
+    set +u; source /shell-hook.sh; set -u; \
+    cd /app/ros2_ws; \
+    colcon build --packages-select trinity_msgs groundingdino_ros \
+        --cmake-args -DBUILD_TESTING=OFF'
 
-# Setup entrypoint
-COPY docker/ros2_entrypoint.sh /app/ros2_entrypoint.sh
-RUN chmod +x /app/ros2_entrypoint.sh
+# Ensure ROS package files are readable and executable regardless of host modes.
+RUN chmod -R a+rX /app/ros2_ws /app/GroundingDINO/docker /app/GroundingDINO/ros2_package
 
-# Environment setup
-ENV ROS2_WS=/app/ros2_ws
-ENV GROUNDINGDINO_PATH=/app/GroundingDINO
-ENV PYTHONPATH=${GROUNDINGDINO_PATH}:${GROUNDINGDINO_PATH}/eval
 
-# Non-root user
-#
-# Reported by Ioana (ORNL, June): the container ran as root, so everything it
-# wrote into the bind-mounted /output landed on the host owned by root:root and
-# needed sudo to clean up.  A container UID has no meaning to the host kernel --
-# the host just sees the number -- so the fix is to run as the UID that owns the
-# host directory.  1000 is the first interactive user on a stock Ubuntu box.
-#
-# If your host UID differs, rebuild with it:
-#   docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) ...
-# or override per-run without rebuilding: docker run --user $(id -u):$(id -g).
-# The latter is why HOME below is world-writable -- an arbitrary --user UID has
-# no passwd entry and would otherwise have nowhere to write.
+# Runtime image.
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
+
+# Run as a non-root user so bind-mounted output has predictable ownership.
+# USER_UID and USER_GID can be overridden at build time.
 ARG USER_NAME=dino
 ARG USER_UID=1000
 ARG USER_GID=1000
-RUN groupadd --gid ${USER_GID} ${USER_NAME} && \
+
+# Native runtime libraries are provided by the Pixi environment.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 24.04 may already have a user with the requested UID.
+RUN if getent passwd ${USER_UID} >/dev/null; then \
+        userdel --remove "$(getent passwd ${USER_UID} | cut -d: -f1)"; \
+    fi; \
+    getent group ${USER_GID} >/dev/null || groupadd --gid ${USER_GID} ${USER_NAME}; \
     useradd --uid ${USER_UID} --gid ${USER_GID} --create-home \
             --shell /bin/bash ${USER_NAME}
 
-ENV HOME=/home/${USER_NAME}
-# Anything that fetches at runtime caches under HOME rather than /root:
-# GroundingDINO pulls bert-base-uncased from the Hub on first inference, and
-# ros2 launch writes its logs to $HOME/.ros/log.  Neither is baked in.
-ENV HF_HOME=${HOME}/.cache/huggingface
-ENV TORCH_HOME=${HOME}/.cache/torch
+# Set ownership while copying to avoid an additional chown layer.
+COPY --from=build --chown=${USER_UID}:${USER_GID} /app /app
+COPY --from=build /shell-hook.sh /shell-hook.sh
+COPY --from=build --chown=${USER_UID}:${USER_GID} /opt/hf-cache /opt/hf-cache
 
-# Auto-source ROS2 for docker exec.
-#
-# This lives in /etc/profile.d rather than a user's ~/.bashrc.  It used to be
-# appended to /root/.bashrc, which worked only by accident: Debian's root
-# .bashrc has no guard, so it ran even non-interactively.  Every *normal* user's
-# .bashrc -- including the one useradd copies from /etc/skel -- opens with
-#     case $- in *i*) ;; *) return;; esac
-# so anything appended after it is dead code under `docker exec bash -lc`.
-# /etc/profile.d applies to every user and every login shell, and does not
-# depend on which home directory the caller happens to land in.
+RUN chmod +x /app/GroundingDINO/docker/ros2_entrypoint.sh
+
+ENV HOME=/home/${USER_NAME}
+
+# Use the baked Hugging Face cache and a per-user Torch cache.
+ENV HF_HOME=/opt/hf-cache \
+    TORCH_HOME=${HOME}/.cache/torch \
+    PYTHONUNBUFFERED=1 \
+    ROS2_WS=/app/ros2_ws \
+    GROUNDINGDINO_PATH=/app/GroundingDINO \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Add project modules imported directly by the ROS node.
+ENV PYTHONPATH=/app/GroundingDINO:/app/GroundingDINO/eval
+
+# ROS_DOMAIN_ID is supplied by the runtime environment or compose configuration.
+
+# Make the Pixi and ROS environments available to shells started with docker exec.
+# profile.d also covers non-interactive login shells.
 RUN printf '%s\n' \
-      'source /opt/ros/humble/setup.bash' \
+      'source /shell-hook.sh' \
       'if [ -f /app/ros2_ws/install/setup.bash ]; then source /app/ros2_ws/install/setup.bash; fi' \
-      'export PYTHONPATH=/app/GroundingDINO:/app/GroundingDINO/eval:$PYTHONPATH' \
-      'export CUDA_HOME=/usr/local/cuda-11.8' \
-      'export PATH=$CUDA_HOME/bin:$PATH' \
-      'export LD_LIBRARY_PATH=$CUDA_HOME/lib64:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH' \
       > /etc/profile.d/ros2_env.sh && \
     chmod 0644 /etc/profile.d/ros2_env.sh && \
     echo '. /etc/profile.d/ros2_env.sh' >> /root/.bashrc && \
     echo '. /etc/profile.d/ros2_env.sh' >> ${HOME}/.bashrc
 
-# Everything above ran as root, so /app is root-owned.  Hand it to the runtime
-# user: pip installed GroundingDINO in editable mode, so imports resolve out of
-# /app/GroundingDINO and Python wants to drop __pycache__ there.
-#
-# `chmod -R a+rX` because COPY preserves the host's modes, and the host tree has
-# oddities -- ros2_package/groundingdino_ros/scripts is 0700 here.  Root ignored
-# that; a non-root user does not, and `ros2 run` reported it as the thoroughly
-# unhelpful "No executable found".  a+rX adds read everywhere and execute only
-# where execute already existed, so it never makes a data file runnable.
-#
-# HOME goes 0777, not 0755, so that `docker run --user <any uid>` still has a
-# writable home -- that UID is not ${USER_NAME} and would otherwise fall over on
-# the first Hub download or ros2 launch.  Nothing secret lives here; it is a
-# cache directory in a single-tenant container.
-RUN chown -R ${USER_UID}:${USER_GID} /app && \
-    chmod -R a+rX /app && \
-    mkdir -p ${HOME}/.ros/log ${HF_HOME} ${TORCH_HOME} && \
-    chmod -R 0777 ${HOME}
+# Keep HOME and /output writable when the container is started with an arbitrary UID.
+RUN mkdir -p ${HOME}/.ros/log ${TORCH_HOME} /output && \
+    chmod -R 0777 ${HOME} /output
 
-# /output is a bind mount owned by the host.  Create it so a container started
-# without one still has somewhere writable to put results.
-RUN mkdir -p /output && chmod 0777 /output
-
-# Set working directory to GroundingDINO root so relative paths work
 WORKDIR /app/GroundingDINO
-
-# Expose ROS2 DDS ports
 EXPOSE 7400-7500/udp
 
-# Drop root.  Everything below this line runs as ${USER_NAME}; use
-# `docker exec -u root <container>` if you need a root shell for debugging.
+# Run the application as the non-root container user.
 USER ${USER_NAME}
 
-ENTRYPOINT ["/app/ros2_entrypoint.sh"]
+ENTRYPOINT ["/app/GroundingDINO/docker/ros2_entrypoint.sh"]
 CMD ["ros2", "launch", "groundingdino_ros", "groundingdino.launch.py"]

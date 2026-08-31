@@ -1,0 +1,51 @@
+# Spool-directory worker -- the non-ROS deployment.
+#
+# Unlike docker-compose.groundingdino.yml this service joins no network, needs
+# no ROS_DOMAIN_ID or RMW implementation, and has no `depends_on`: it talks to
+# the rest of the system through a directory, so anything that can write a file
+# can drive it.
+#
+#     docker compose -f docker/docker-compose.spool.yml up --build
+#
+# The `version:` key that the ROS compose file carries is omitted -- it has been
+# obsolete since Compose v2 and now only produces a warning.
+
+services:
+  spool:
+    image: selectivetracking-spool:latest
+    build:
+      # The build context is the project root, not docker/, because the image
+      # installs from pyproject.toml and pixi.lock.
+      context: ..
+      dockerfile: docker/Dockerfile.spool
+    container_name: selectivetracking_spool_${USER:-user}
+
+    volumes:
+      # The spool.  Read-write: this is where results are published.
+      - ${SPOOL_PATH:-./spool}:/spool:rw
+      # The detector checkpoint (~938 MB), read-only.  Not in the image: it is
+      # versioned outside this repository and would dominate the image size.
+      - ${WEIGHTS_PATH:-../weights}:/weights:ro
+
+    environment:
+      # Default question, used by any job whose sidecar does not override it.
+      GDINO_PROMPT: "red car."
+      GDINO_EXTRA_ARGS: "--fp16"
+      # Safe here because this compose file runs exactly one replica; see
+      # SPOOL.md before scaling this service.
+      SPOOL_REQUEUE_ORPHANS: "1"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # A long job should not be SIGKILLed at the ten-second default: the worker
+    # aborts on SIGTERM and puts the input back in in/, but it needs a moment to
+    # stop the child and complete the rename.
+    stop_grace_period: 60s
+
+    restart: unless-stopped

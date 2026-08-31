@@ -1,36 +1,259 @@
 [build-system]
-# We still use setuptools as the backend because of the CUDA extensions
-requires = ["setuptools>=82.0.1,<83", "wheel", "setuptools_scm"]
-build-backend = "setuptools.build_meta"
+# Pure Python now.  The CUDA extension used to be built by this project's own
+# setup.py against the vendored groundingdino/ tree; it comes from the
+# groundingdino-py-cuda conda package instead, so there is nothing left to
+# compile and no reason to keep setuptools' build machinery.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
-name = "groundingdino"
+# This project is SelectiveTracking.  It called itself `groundingdino` only
+# because it was built from GroundingDINO's own pyproject, which is exactly the
+# confusion the split removes.
+name = "selectivetracking"
 version = "0.1.0"
-description = "open-set object detector"
+description = "Selective multi-object tracking with open-vocabulary detection"
 authors = [
-    {name = "Shilong Liu", email = "shilongliu.cv@gmail.com"},
-    {name = "International Digital Economy Academy"}
+    {name = "Di Yao", email = "di.yao@vanderbilt.edu"},
+    {name = "Azhar Hasan", email = "azhar.hasan@vanderbilt.edu"},
 ]
 license = {file = "LICENSE"}
 readme = "README.md"
 requires-python = ">=3.10"
-# These match your requirements.txt logic
-dependencies = [
-    "torch>=2.1.0",
+
+# Deliberately empty.  This is an application, installed as an editable package
+# into a pixi environment, and [tool.pixi.dependencies] below is the single
+# authoritative dependency list.
+#
+# Stating them here as well makes pixi resolve the same names a second time
+# against PyPI, which fails and would be wrong even if it succeeded:
+#
+#   * groundingdino-py on PyPI is 0.4.0 and does not carry the fixes this
+#     project contributed.  The >=0.4.1 that does comes from the conda feedstock,
+#     and will only reach PyPI when upstream cuts a release.
+#   * torch from PyPI beside pytorch from conda puts two builds of the same
+#     library in one environment.
+dependencies = []
+
+[project.optional-dependencies]
+# The pip path, for environments that have no conda: `docker/Dockerfile.ros2`,
+# which builds on a ROS 2 Humble image whose rclpy and cv_bridge come from apt
+# and are bound to the system interpreter, so a pixi environment cannot be
+# swapped in underneath them.
+#
+# This is the former `requirements.txt`, moved here so the project states its
+# dependencies in one file rather than two that drift.  It stays a *separate*
+# list from [tool.pixi.dependencies] rather than a generated view of it, because
+# the two ecosystems disagree on names and on what exists at all:
+#
+#     conda            pip
+#     pytorch          torch
+#     opencv           opencv-python
+#     groundingdino-py  -- >=0.4.1 is not on PyPI; the Dockerfile builds it from
+#                          git instead, which is why it is absent below
+#
+# pixi does not resolve this table.  Extras reach an editable path dependency
+# only when it asks for them by name, and [tool.pixi.pypi-dependencies] requests
+# `selectivetracking` with no `extras`, so the duplicate-resolution problem
+# described above stays solved.
+docker = [
+    "torch<=2.1.2",
     "torchvision",
-    "numpy",
+    "numpy==1.26.2",
+    # Vestigial: this pinned setuptools so the old setup.py could build the
+    # vendored CUDA extension under `--no-build-isolation`.  There is no such
+    # build any more, but pip on the ROS image does not guarantee setuptools,
+    # and dropping a pin is a change to make deliberately rather than in passing.
+    "setuptools==78.1.1",
+    "transformers==4.49.0",
+    "supervision>=0.22.0",
     "opencv-python",
-    "supervision",
-    "pycocotools",
-    "transformers",
+    "timm",
+    "accelerate",
+    "einops",
     "addict",
     "yapf",
-    "timm"
+    "pycocotools",
+    "cython_bbox",
+    "lap",
+    # OpenAI's CLIP, from git.  The `clip` on PyPI is an unrelated clipboard
+    # manager whose module exports nothing, so `import clip` succeeds and
+    # clip.load() raises AttributeError.  Upstream cuts no releases; pinned by
+    # commit so the two dependency paths below resolve the same code.
+    "clip @ git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6",
+    "pandas",
+    "motmetrics",
+    "ipykernel",
 ]
 
-[tool.setuptools]
-packages = {find = {exclude = ["configs", "tests"]}}
+[tool.hatch.metadata]
+# The `docker` extra pins OpenAI's CLIP by git URL.  Hatchling rejects a direct
+# reference in optional-dependencies unless this says otherwise.
+allow-direct-references = true
 
-[tool.setuptools.exclude-package-data]
-"*" = ["configs*", "tests*"]
+[tool.hatch.build.targets.wheel]
+# `groundingdino/` is deliberately absent.  What survives there is two model
+# config files, read by path at run time, belonging to no package -- and the
+# directory has no `__init__.py`, so it stays a namespace portion that loses to
+# the installed regular package.  Shipping it would put a second `groundingdino`
+# on sys.path.
+packages = ["eval", "tracker", "utils", "helper"]
 
+# ── pixi ─────────────────────────────────────────────────────────────────────
+# Merged from the standalone pixi.toml, which is deleted.  One file now
+# describes this project to both pip and pixi; two files stating the same
+# dependency set is how they drift apart.
+
+[tool.pixi.workspace]
+authors = ["Di Yao <di.yao@vanderbilt.edu>"]
+# One channel.  The local channel that carried groundingdino-py while the
+# feedstock was in review is gone -- conda-forge publishes both packages now.
+#
+# The `pytorch` and `nvidia` channels are gone too, and with them the
+# `channel-priority = "disabled"` that pixi.toml needed to make the three
+# co-exist.  groundingdino-py-cuda is built against conda-forge's CUDA pytorch,
+# so pulling pytorch from the `pytorch` channel would put two different builds
+# of the same library in one environment.  One channel, one pytorch.
+channels = ["conda-forge"]
+name = "selectivetracking"
+version = "0.1.0"
+
+# The CUDA requirement rides on the platform entry; the [system-requirements]
+# table pixi.toml used for it is deprecated.
+#
+# 12.9 rather than the 12.1 the local channel's build was compiled against:
+# conda-forge builds groundingdino-py-cuda only against `cuda-version >=12.9`.
+platforms = [{ platform = "linux-64", linux = "5.15", cuda = "12.9" }]
+
+[tool.pixi.pypi-dependencies]
+selectivetracking = { path = ".", editable = true }
+cython_bbox = "*"
+# Same commit as the `docker` extra above, and for the same reason: PyPI's
+# `clip` is a clipboard manager, not OpenAI's model.
+clip = { git = "https://github.com/openai/CLIP.git", rev = "d05afc436d78f1c48dc0dbf8e5980a9d471f35f6" }
+
+[tool.pixi.dependencies]
+# Shared by every environment below.  The Python pin is deliberately NOT here --
+# it lives in the `py310` feature, because the `ros` environment cannot have it;
+# see [tool.pixi.feature.ros] for why.
+pip = ">=26.0.1,<27"
+
+# The detector, as a package.  `groundingdino-py` is the detector itself, pure
+# Python; `-cuda` adds the compiled deformable-attention extension.
+#
+# On a machine with no NVIDIA GPU, drop the `-cuda` line -- that is all.  The
+# model then takes the pure-PyTorch fallback, which is correct but slow, and must
+# stay in float32 since grid_sample has no half-precision CPU kernel.
+groundingdino-py = ">=0.4.2"
+groundingdino-py-cuda = ">=0.4.2"
+
+# groundingdino-py-cuda already requires `pytorch *cuda*`, so the CUDA build is
+# selected by the detector rather than pinned here.  `pytorch-cuda` is gone: it
+# is the `pytorch` channel's way of expressing this, and conda-forge uses the
+# build string plus `cuda-version` instead.
+pytorch = ">=2.1.0"
+torchvision = "*"
+
+# The build toolchain that used to live here -- cuda-nvcc, cuda-toolkit,
+# gxx_linux-64, ninja, and the libcublas / libcusolver / libcusparse / libcurand
+# -dev packages -- is gone.  It was here only to compile the vendored extension,
+# and the package ships that already built.
+numpy = ">=1.26.2"
+opencv = "*"
+timm = "*"
+#transformers = ">=4.49.0"
+transformers = "==4.49.0"
+supervision = ">=0.22.0"
+ipykernel = "*"
+lap = "*"
+pandas = "*"
+motmetrics = "*"
+accelerate = "*"
+einops = "*"
+addict = "*"
+yapf = "*"
+pycocotools = "*"
+
+# ── environments ─────────────────────────────────────────────────────────────
+# Two: the developer/spool environment, and the one the ROS image installs.
+# Both draw on [tool.pixi.dependencies] above, so the application's dependency
+# list is still stated once.  Only what genuinely differs is split out.
+
+[tool.pixi.feature.py310.dependencies]
+# 3.10 is what this project has always used.  It is a feature rather than a
+# plain dependency only so that the `ros` environment can pick a different one.
+python = "3.10.*"
+
+[tool.pixi.feature.ros]
+# RoboStack, which is NOT on conda-forge -- `ros-humble-*` lives on its own
+# channel.  Scoping it to this feature keeps the default environment
+# conda-forge-only, as the workspace comment above describes.
+channels = ["robostack-humble", "conda-forge"]
+
+[tool.pixi.feature.ros.dependencies]
+# 3.12, not 3.10, and this is forced rather than chosen: RoboStack publishes
+# linux-64 humble builds for 3.9, 3.11 and 3.12 only, and 3.12 is the one the
+# current release (rclpy 3.3.21) is built for.  It resolves because
+# groundingdino-py-cuda also has a cuda129_py312 build; the two would not
+# otherwise meet.
+python = "3.12.*"
+
+# The runtime the node imports -- see ros2_package/groundingdino_ros/package.xml.
+# This replaces `apt-get install ros-humble-cv-bridge ros-humble-vision-msgs`
+# and, with it, the whole reason Dockerfile.ros2 had to install everything with
+# pip: apt's rclpy is bound to the system interpreter, so a conda environment
+# could not be swapped in underneath it.  RoboStack's is a conda package, so it
+# can.
+ros-humble-rclpy = "*"
+ros-humble-cv-bridge = "*"
+ros-humble-sensor-msgs = "*"
+ros-humble-std-msgs = "*"
+ros-humble-geometry-msgs = "*"
+
+# docker-compose.groundingdino.yml sets RMW_IMPLEMENTATION=rmw_cyclonedds_cpp,
+# and the running stack has to agree on the middleware or nothing connects.
+# apt supplied this implicitly; RoboStack ships only the default RMW unless it
+# is asked for by name.
+ros-humble-rmw-cyclonedds-cpp = "*"
+
+# The `ros2` command itself.  apt's ros-humble-ros-base supplied it implicitly;
+# RoboStack does not, so without this the image's own
+# CMD ["ros2", "launch", ...] exits with "exec: ros2: not found".
+# The meta-package carries the verbs this repo uses -- launch, topic, run, pkg,
+# node, interface -- and ros-humble-ros-base carries none of them.
+ros-humble-ros2cli-common-extensions = "*"
+
+# The toolchain colcon needs to build groundingdino_ros and trinity_msgs from
+# source, matching the buildtool_depend entries in package.xml.
+ros-humble-ament-cmake = "*"
+ros-humble-ament-cmake-python = "*"
+ros-humble-rosidl-default-generators = "*"
+ros-humble-rosidl-default-runtime = "*"
+ros-humble-ros-workspace = "*"
+colcon-common-extensions = "*"
+cmake = "*"
+ninja = "*"
+pkg-config = "*"
+
+[tool.pixi.environments]
+default = ["py310"]
+ros = ["ros"]
+
+[tool.pixi.tasks.demo]
+cmd = "python3 demo/inference_w_worker.py --video ../videos/carla1.mp4 --output ../output_2/annotated.mp4 --text-prompt \"red car.\" --fp16"
+description = "Run inference on a sample CARLA video with the 'red car' prompt"
+
+[tool.pixi.tasks.cuda-check]
+cmd = "python3 scripts/cuda-check.py"
+description = "Verify CUDA availability and print GPU/driver info"
+
+[tool.pixi.tasks.nuclear]
+cmd = "bash scripts/nu-clear.sh"
+description = "Remove all build artifacts and caches for a clean slate"
+
+# `build` is gone with setup.py: there is no extension to compile here any more.
+#
+# recipe.yaml is still here, but it no longer builds the detector -- that is the
+# feedstock's job now.  It packages *this* project, pure Python and noarch:
+#
+#     rattler-build build --recipe recipe.yaml --channel conda-forge

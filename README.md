@@ -18,22 +18,52 @@ Built on top of [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO),
 
 ## Setup
 
-**Requirements:** Python 3.10, CUDA-capable GPU
+**Requirements:** Python 3.10, CUDA-capable GPU (CUDA 12.9 or newer)
 
 ```bash
 git clone https://github.com/azzy13/selectivetracking.git
 cd selectivetracking
 
-conda create -n env_dino python=3.10
-conda activate env_dino
-
-pip install -r requirements.txt
-pip install -e . --no-build-isolation
+pixi install
 ```
 
-> `--no-build-isolation` is required so the build step can find the already-installed torch when compiling the CUDA ops.
+That is the whole setup. `pyproject.toml` is the single dependency list, and
+[pixi](https://pixi.sh) resolves it from conda-forge — including the detector
+itself, which is no longer vendored in this repository:
 
-Key dependencies installed by `requirements.txt`:
+| Package | What it is |
+|---|---|
+| [`groundingdino-py`](https://prefix.dev/channels/conda-forge/packages/groundingdino-py) | The detector, pure Python (noarch) |
+| [`groundingdino-py-cuda`](https://prefix.dev/channels/conda-forge/packages/groundingdino-py-cuda) | Its prebuilt deformable-attention CUDA extension |
+
+Nothing is compiled at install time. On a machine with no NVIDIA GPU, drop the
+`groundingdino-py-cuda` line from `[tool.pixi.dependencies]`; the model then
+takes the pure-PyTorch fallback, which is correct but slow, and must stay in
+float32 because `grid_sample` has no half-precision CPU kernel.
+
+Run anything in the environment with `pixi run`:
+
+```bash
+pixi run python3 demo/inference_w_worker.py --help
+pixi run cuda-check
+```
+
+<details>
+<summary>Installing with pip instead</summary>
+
+The `docker` extra is the pip-name spelling of the same dependency set, for
+environments that have no conda — there is no `requirements.txt`. It cannot
+supply the detector, though: PyPI's `groundingdino-py` is 0.4.0 and predates the
+fixes this project contributed, so install that from source alongside. This is
+what `docker/Dockerfile.ros2` does.
+
+```bash
+conda create -n env_dino python=3.10 && conda activate env_dino
+pip install -e '.[docker]'
+pip install git+https://github.com/phreed/GroundingDINO.git@integration/split-fixes
+```
+
+</details>
 
 ---
 

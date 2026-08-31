@@ -11,6 +11,7 @@ Deliberately minimal:
 The scene graph filter interprets per-frame track attributes (color_votes,
 region, heading) to keep only tracks that match the mission prompt.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,7 +24,7 @@ import numpy as np
 import time
 import torch
 from PIL import Image
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torchvision import transforms as T
 
 from groundingdino.util.inference import load_model, predict
@@ -217,7 +218,7 @@ class Worker:
     def _detect(self, frame_bgr: np.ndarray, tensor: torch.Tensor,
                 orig_h: int, orig_w: int) -> np.ndarray:
         init_thresh = self.box_thresh * 0.5 if self.use_scale_aware_thresh else self.box_thresh
-        with torch.no_grad(), autocast(enabled=self.use_fp16):
+        with torch.no_grad(), autocast(device_type=str(self.device).split(":")[0], enabled=self.use_fp16):
             boxes, logits, _ = predict(
                 model=self.dino_model,
                 image=tensor,

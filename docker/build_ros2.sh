@@ -13,21 +13,13 @@ echo "Project root: $PROJECT_ROOT"
 echo "Docker context: $PROJECT_ROOT"
 echo ""
 
-# Which trinity_msgs definitions to build against.
+# groundingdino_ros must use the same trinity_msgs definitions as the rest of
+# the ROS stack. Use the vendored definitions by default; set TRINITY_MSGS_REF
+# and TRINITY_MSGS_SRC to build against another checkout.
 #
-# groundingdino_ros publishes trinity_msgs/msg/PerceptionArray.  ROS 2 matches a
-# publisher to a subscriber by the fully-qualified type name and the message
-# definition, so the image has to contain a package that really is named
-# trinity_msgs with the fields the stack expects -- and if the definitions
-# differ, the two do not connect, SILENTLY: no error, no warning, no data.
-#
-# The definitions the running architecture_demo stack pins (31287a1, "message
-# definitions for perception 0.22") are vendored at ros2_package/trinity_msgs,
-# so this build needs no trinity_msgs checkout.  See that directory's README.
-#
-# To build against a different revision instead, point at a checkout:
+# Examples:
 #   TRINITY_MSGS_REF=master TRINITY_MSGS_SRC=/path/to/trinity_msgs ./docker/build_ros2.sh
-#   TRINITY_MSGS_REF=WORKTREE TRINITY_MSGS_SRC=...   # copy its working tree as-is
+#   TRINITY_MSGS_REF=WORKTREE TRINITY_MSGS_SRC=/path/to/trinity_msgs ./docker/build_ros2.sh
 TRINITY_MSGS_REF="${TRINITY_MSGS_REF:-VENDORED}"
 
 rm -rf "$TRINITY_MSGS_STAGE"
@@ -44,8 +36,8 @@ if [ "$TRINITY_MSGS_REF" = "VENDORED" ]; then
     cp -r "$TRINITY_MSGS_VENDORED/." "$TRINITY_MSGS_STAGE/"
     rm -f "$TRINITY_MSGS_STAGE/README.md"
 else
-    # Overridden: this path DOES need a checkout, because a git revision only
-    # exists in one.
+
+    # Non-vendored revisions require a local trinity_msgs checkout.
     TRINITY_MSGS_SRC="${TRINITY_MSGS_SRC:-$(dirname "$PROJECT_ROOT")/trinity_msgs}"
     if [ ! -d "$TRINITY_MSGS_SRC" ]; then
         echo "ERROR: TRINITY_MSGS_REF=$TRINITY_MSGS_REF needs a trinity_msgs checkout,"
@@ -72,7 +64,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Build the Docker image
+# Build the image from the project root so the staged messages are in context.
 docker build \
     -f "$SCRIPT_DIR/Dockerfile.ros2" \
     -t groundingdino_ros:latest \

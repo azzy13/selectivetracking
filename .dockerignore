@@ -40,8 +40,9 @@ eval/results/
 track_results.txt
 *.csv
 
-# But keep requirements.txt and the staged trinity_msgs
-!requirements.txt
+# But keep the staged trinity_msgs.  (The rule that kept requirements.txt is
+# gone with the file; the dependency list is the `docker` extra in
+# pyproject.toml, which no rule here excludes.)
 !_trinity_msgs_build/
 
 # Python cache
@@ -82,6 +83,11 @@ ENV/
 env.bak/
 venv.bak/
 
+# The solved pixi environment -- ~12 GB of it.  Dockerfile.spool builds its own
+# from pixi.lock inside the image, so sending this would be pure build-context
+# cost, and it would land on top of the environment the image just solved.
+.pixi/
+
 # IDE
 .vscode/
 .idea/
@@ -95,15 +101,12 @@ venv.bak/
 .gitignore
 .gitattributes
 
-# Host-local pixi environment. 15 GB, and nothing in the image uses it -- the
-# container's interpreter is the system python3, and deps come from pip.
-# Copying it in doubled the image size.
-.pixi/
-pixi.lock
-pixi.toml
-
 # Documentation (not needed in image)
 *.md
+# ...except README.md, which is not documentation as far as the build is
+# concerned: pyproject.toml declares `readme = "README.md"`, and hatchling
+# fails with "Readme file does not exist" if it is not in the build context.
+!README.md
 docs/
 /site
 

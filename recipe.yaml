@@ -1,58 +1,138 @@
 schema_version: 1
 
+# Conda recipe for SelectiveTracking -- this project.
+#
+# It used to build the *detector*: `package.name` was `groundingdino`, the
+# source was this repository's vendored GroundingDINO tree, and the build
+# compiled the deformable-attention CUDA extension (FORCE_CUDA, cuda-nvcc 12.1,
+# TORCH_CUDA_ARCH_LIST).  None of that belongs here any more.  The detector is
+# `groundingdino-py` / `groundingdino-py-cuda` on conda-forge, built by its own
+# feedstock, and this project consumes it like any other dependency.
+#
+# Build it:
+#
+#     rattler-build build --recipe recipe.yaml --channel conda-forge
+#
+# The `--channel pytorch --channel nvidia` the old invocation carried are gone
+# for the same reason they left pyproject.toml: groundingdino-py-cuda is built
+# against conda-forge's CUDA pytorch, and mixing channels puts two builds of the
+# same library in one environment.
+
+context:
+  # Must track `version` in pyproject.toml -- the one value stated twice here.
+  #
+  # rattler-build can read it instead, but only behind a flag:
+  #
+  #   version: ${{ load_from_file("pyproject.toml").project.version }}
+  #
+  # which then requires `--experimental` on every build and rules the recipe out
+  # of a feedstock.  A scalar kept in step by hand is the cheaper trade.
+  version: "0.1.0"
+
 package:
-  name: groundingdino
-  version: 0.1.0
+  name: selectivetracking
+  version: ${{ version }}
 
 source:
   - path: .
 
 build:
   number: 0
+  # Pure Python.  The wheel hatchling produces is py3-none-any -- it carries
+  # eval/, tracker/, utils/ and the helper module, and nothing compiled.
+  noarch: python
   script:
     content:
-      - pip install --no-deps --no-build-isolation .
-    env:
-      FORCE_CUDA: "1"
-      CUDA_HOME: $CONDA_PREFIX
-      CPATH: $CONDA_PREFIX/include
-      LIBRARY_PATH: $CONDA_PREFIX/lib
-      LDFLAGS: "-L$CONDA_PREFIX/lib -Wl,-rpath,$CONDA_PREFIX/lib"
-      TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9"
-  python:
-    entry_points: []
+      - python -m pip install --no-deps --no-build-isolation . -vv
 
 requirements:
-  build:
-    - ${{ compiler('c') }}
-    - ${{ compiler('cxx') }}
-    - cuda-nvcc 12.1.*
+  # No `build:` section: with nothing to compile there is no C or C++ compiler
+  # and no CUDA toolchain to ask for.
   host:
     - python >=3.10
     - pip
-    - setuptools >=82.0.1,<83
-    - wheel
-    - setuptools_scm
-    - ninja >=1.13.2,<2
-    - pytorch >=2.1.0
-    - cuda-toolkit 12.1.*
-    - cuda-nvcc 12.1.*
-    - cuda-cudart-dev >=12.1.105,<13
+    # The build backend, per [build-system] in pyproject.toml.  setuptools,
+    # wheel, setuptools_scm and ninja were needed by the old setup.py and are
+    # gone with it.
+    - hatchling
   run:
     - python >=3.10
+
+    # The detector.  `groundingdino-py` is pure Python and is what the code
+    # imports; adding `groundingdino-py-cuda` beside it swaps in the prebuilt
+    # deformable-attention extension.
+    #
+    # It is deliberately NOT a run requirement here.  Depending on it would make
+    # this package uninstallable on a machine with no NVIDIA GPU, where the
+    # pure-PyTorch fallback is correct -- just slow, and float32-only, because
+    # grid_sample has no half-precision CPU kernel.  Install it alongside on a
+    # GPU host.
+    - groundingdino-py >=0.4.1
+
+    # The rest mirrors [tool.pixi.dependencies] in pyproject.toml.  `pip` and
+    # `ipykernel` are absent on purpose: they are how the environment is driven,
+    # not what the package needs at run time.
     - pytorch >=2.1.0
     - torchvision
     - numpy >=1.26.2
     - opencv
-    - supervision >=0.22.0
-    - pycocotools
+    - timm
     - transformers >=4.49.0
+    - supervision >=0.22.0
+    - lap
+    - pandas
+    - motmetrics
+    - accelerate
+    - einops
     - addict
     - yapf
-    - timm
+    - pycocotools
+
+    # NOT EXPRESSIBLE HERE -- two run dependencies exist only on PyPI:
+    #
+    #   cython_bbox   imported by tracker/matching.py, which byte_tracker sits
+    #                 on, so it is on the main tracking path and not optional
+    #   clip          imported by eval/worker.py, eval/eval.py and
+    #                 eval/worker_clean.py
+    #
+    # Neither has a conda-forge package (`clip` there is unrelated).  A conda
+    # environment built from this package therefore has to add them with pip
+    # before the pipeline will import, which is what
+    # [tool.pixi.pypi-dependencies] does for the pixi environment:
+    #
+    #     pip install cython_bbox clip
+    #
+    # This is the one thing the conda package cannot state about itself.
+
+tests:
+  - python:
+      imports:
+        - eval
+        - tracker
+        - utils
+      # Off, and not because this package fails it.  `pip check` in the test
+      # environment reports:
+      #
+      #   motmetrics 1.2.0 requires flake8, which is not installed.
+      #   motmetrics 1.2.0 requires flake8-import-order, ...
+      #   motmetrics 1.2.0 requires pytest, ...
+      #   motmetrics 1.2.0 requires pytest-benchmark, ...
+      #
+      # conda-forge's motmetrics carries its test extras as hard PyPI metadata
+      # requirements, so the check fails on a dependency's packaging, not ours.
+      # Turn it back on if that is ever fixed upstream -- selectivetracking
+      # itself declares no dependencies (pyproject keeps `dependencies = []`),
+      # so it has nothing of its own to fail.
+      pip_check: false
 
 about:
-  summary: Open-set object detector
+  summary: Text-guided multi-object tracking with open-vocabulary detection
+  description: |
+    Extends GroundingDINO into a text-guided multi-object tracking pipeline:
+    open-vocabulary detection, ByteTrack/CLIP tracking, a per-frame scene graph
+    of spatial relations, motion, colour and size, and colour re-identification
+    across brief occlusions.
   license: Apache-2.0
   license_file: LICENSE
-  homepage: https://github.com/IDEA-Research/GroundingDINO
+  homepage: https://github.com/azzy13/selectivetracking
+  repository: https://github.com/azzy13/selectivetracking
