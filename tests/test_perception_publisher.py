@@ -1,4 +1,4 @@
-"""Field-mapping tests for the trinity Perception output."""
+"""Field-mapping tests for the Perception output."""
 
 import types
 
@@ -12,7 +12,7 @@ from perception_publisher import (
 
 
 class Perception022:
-    """Stand-in for the trinity_msgs 0.22 Perception (no frame_number)."""
+    """Stand-in for the Perception this repo defines (no frame_number)."""
 
     __slots__ = ("tracking_id", "target_entity_id", "detection_prob",
                  "location", "yaw", "entity_class", "entity_color",
@@ -24,7 +24,7 @@ class Perception022:
 
 
 class Perception058(Perception022):
-    """0.58 adds frame_number, occlusion and pose."""
+    """Variant with the optional frame_number, occlusion and pose fields."""
 
     __slots__ = ("frame_number", "occlusion", "pose")
 
@@ -115,7 +115,7 @@ def test_fields_populated_under_022():
     # deliberately not estimated
     assert msg.yaw == 0.0
     assert msg.entity_class == ""
-    # 0.22 has no frame_number; setting it must not raise
+    # This repo's Perception has no frame_number; setting it must not raise
     assert not hasattr(msg, "frame_number")
 
 

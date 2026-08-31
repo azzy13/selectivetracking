@@ -1,7 +1,7 @@
 """
 Image-plane -> AirSim NED world projection for GroundingDINO tracks.
 
-trinity_msgs Perception.location is float32[3] in metres, AirSim NED
+msgs Perception.location is float32[3] in metres, AirSim NED
 (x=North, y=East, z=Down, ground at z=0). Consumers treat it as such:
 prediction_node feeds location[0:2] straight into its map.
 

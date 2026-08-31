@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Perception Recorder Node - saves the trinity Perception output to disk.
+Perception Recorder Node - saves the Perception output to disk.
 
 The node publishes PerceptionArray on a topic and nothing else persists it.
 This subscribes and writes two files:
@@ -8,9 +8,9 @@ This subscribes and writes two files:
   <out>.jsonl  one JSON object per PerceptionArray message, full fidelity
   <out>.csv    one row per perception, flat, for a quick eyeball or a plot
 
-Field access goes through getattr so the same recorder works against
-trinity_msgs 0.22 (what the running stack pins) and 0.58, which adds
-frame_number, occlusion and pose.
+Field access goes through getattr so the same recorder works whether or not
+the built msgs package defines the optional frame_number, occlusion and pose
+fields.
 
 Usage:
     python3 perception_recorder.py --output /output/perceptions
@@ -25,7 +25,7 @@ from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy)
 
-from trinity_msgs.msg import PerceptionArray
+from msgs.msg import PerceptionArray
 
 DEFAULT_TOPIC = "/vanderbilt/fake_perception/data"
 
@@ -89,7 +89,7 @@ class PerceptionRecorder(Node):
                 "entity_color": p.entity_color,
                 "match_prob": float(p.match_prob),
             }
-            # Present in 0.58, absent in the pinned 0.22.
+            # Optional; absent from this repo's definitions.
             for field in ("frame_number", "occlusion", "pose"):
                 if hasattr(p, field):
                     entry[field] = getattr(p, field)

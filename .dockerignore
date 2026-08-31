@@ -40,9 +40,9 @@ eval/results/
 track_results.txt
 *.csv
 
-# But keep requirements.txt and the staged trinity_msgs
+# But keep requirements.txt and the staged msgs
 !requirements.txt
-!_trinity_msgs_build/
+!_msgs_build/
 
 # Python cache
 __pycache__/

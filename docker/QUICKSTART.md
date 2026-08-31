@@ -25,10 +25,9 @@ cd ..
 ./docker/build_ros2.sh
 ```
 
-Self-contained — the `trinity_msgs` message definitions the node publishes are
-vendored at `ros2_package/trinity_msgs`, so no `trinity_msgs` checkout is
-needed. See "Message version skew" in `DEMO.md` to build against a different
-revision.
+Self-contained — the `msgs` message definitions the node publishes live at
+`ros2_package/msgs` and are staged into the Docker context by the build
+script, so no external checkout is needed.
 
 ### 3. Run GroundingDINO Node
 
@@ -134,7 +133,7 @@ GroundingDINO/
 │   └── tracking.mp4                  ← Video output
 └── ros2_package/
     ├── groundingdino_ros/
-    └── trinity_msgs/                 ← Vendored msg definitions (0.22)
+    └── msgs/                         ← Message definitions
 ```
 
 

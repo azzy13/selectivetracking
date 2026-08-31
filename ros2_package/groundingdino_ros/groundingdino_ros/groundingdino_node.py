@@ -3,8 +3,7 @@
 GroundingDINO ROS2 Node - Wraps Worker class for detection and tracking.
 
 This node subscribes to camera images, runs GroundingDINO detection with ByteTrack/CLIP tracking,
-and publishes tracking results as Trinity messages for plug-and-play compatibility with other
-SRI perception models.
+and publishes tracking results.
 """
 
 import sys
@@ -27,7 +26,7 @@ sys.path.insert(0, str(GROUNDINGDINO_ROOT))
 
 from worker_simple import Worker
 from scene_graph import SceneGraphBuilder, SceneGraphMissionFilter
-from trinity_msgs.msg import Detection, DetectionArray, Perception, PerceptionArray
+from msgs.msg import Detection, DetectionArray, Perception, PerceptionArray
 
 # Import mission parser (same directory when installed)
 try:
@@ -53,13 +52,13 @@ PERCEPTION_QOS = QoSProfile(
 
 
 def _set_if_present(msg, field: str, value) -> bool:
-    """Assign msg.field only if this trinity_msgs build actually defines it.
+    """Assign msg.field only if this msgs build actually defines it.
 
-    We build against the trinity_msgs revision the running stack pins (0.22),
-    but the repo HEAD (0.58) has extra fields.  rosidl message classes use
-    __slots__, so assigning a field that does not exist in the built revision
-    raises AttributeError and kills the frame.  This keeps one node source
-    working against both revisions.
+    Some builds of msgs carry optional extra fields (frame_number,
+    occlusion, pose) that this repo's definitions do not.  rosidl message
+    classes use __slots__, so assigning a field the built package does not
+    define raises AttributeError and kills the frame.  This keeps one node
+    source working against either field set.
     """
     if hasattr(msg, field):
         setattr(msg, field, value)
@@ -99,7 +98,7 @@ class GroundingDINONode(Node):
         )
         self.get_logger().info(f"Subscribed to: {camera_topic}")
 
-        # Publishers (Trinity messages for plug-and-play compatibility)
+        # Publishers (shared message types for plug-and-play compatibility)
         self.detections_pub = self.create_publisher(
             DetectionArray,
             self.get_parameter('detections_topic').value,
@@ -124,18 +123,18 @@ class GroundingDINONode(Node):
             10
         )
 
-        # Corrected trinity Perception output, alongside the legacy topics
-        self.trinity_enabled = bool(
-            self.get_parameter('publish_trinity_perception').value)
-        self.trinity_pub = None
+        # Corrected Perception output, alongside the legacy topics
+        self.perception_output_enabled = bool(
+            self.get_parameter('publish_perception_output').value)
+        self.perception_output_pub = None
         self.projector = None
         self.sg_builder = None
         self.entities = []
         self.mission_filters = {}
         self.depth_available = False
         self._last_projection_method = None
-        if self.trinity_enabled:
-            self._init_trinity_perception()
+        if self.perception_output_enabled:
+            self._init_perception_output()
 
         # State
         self.frame_id = 0
@@ -174,14 +173,14 @@ class GroundingDINONode(Node):
         self.declare_parameter('mission_config_path', '/mission_briefing/config.json')
         self.declare_parameter('output_visualization', True)
 
-        # Output topic names (Trinity messages)
+        # Output topic names
         self.declare_parameter('detections_topic', '/perception/detections')
         self.declare_parameter('perceptions_topic', '/perception/perceptions')
 
-        # Corrected trinity Perception output. Published alongside the
+        # Corrected Perception output. Published alongside the
         # legacy topics above, which are left exactly as they were.
-        self.declare_parameter('publish_trinity_perception', True)
-        self.declare_parameter('trinity_perception_topic',
+        self.declare_parameter('publish_perception_output', True)
+        self.declare_parameter('perception_output_topic',
                                '/vanderbilt/fake_perception/data')
 
         # Inputs needed to place a track in the world
@@ -273,7 +272,7 @@ class GroundingDINONode(Node):
             )
             self.text_prompt = new_prompt
             self.worker.text_prompt = new_prompt
-            if self.trinity_enabled:
+            if self.perception_output_enabled:
                 self._reload_entities()
 
         self.last_prompt_reload = now
@@ -323,9 +322,9 @@ class GroundingDINONode(Node):
             # Publish tracking results (legacy topics, unchanged)
             self._publish_tracks(tracks, msg.header, orig_h, orig_w)
 
-            # Corrected trinity Perception output
-            if self.trinity_enabled:
-                self._publish_trinity_perception(
+            # Corrected Perception output
+            if self.perception_output_enabled:
+                self._publish_perception_output(
                     tracks, msg, orig_h, orig_w, frame)
 
             # Optionally publish visualization
@@ -344,7 +343,7 @@ class GroundingDINONode(Node):
             self.get_logger().error(f"Error processing frame: {e}", throttle_duration_sec=1.0)
 
     def _publish_tracks(self, tracks, header, img_h: int, img_w: int):
-        """Publish tracking results as Trinity ROS2 messages."""
+        """Publish tracking results as ROS2 messages."""
 
         frame_num = self.frame_id % 65536  # uint16 wrap
 
@@ -380,7 +379,7 @@ class GroundingDINONode(Node):
             det_msg.car_type_probs = [score]
             det_msg.color_names = []
             det_msg.color_probs = []
-            # 0.58-only fields; absent from the pinned 0.22 the stack runs
+            # Optional fields; absent from this repo's definitions
             _set_if_present(det_msg, "occlusion_level", 0)
             _set_if_present(det_msg, "occlusion_label", "")
             _set_if_present(det_msg, "pose_idx", 0)
@@ -395,7 +394,7 @@ class GroundingDINONode(Node):
             perc_msg.yaw = 0.0
             perc_msg.entity_class = "object"
             perc_msg.entity_color = ""
-            # 0.58-only fields; absent from the pinned 0.22 the stack runs
+            # Optional fields; absent from this repo's definitions
             _set_if_present(perc_msg, "occlusion", "")
             _set_if_present(perc_msg, "pose", "")
             perc_msg.match_prob = score
@@ -404,18 +403,18 @@ class GroundingDINONode(Node):
         self.detections_pub.publish(det_array_msg)
         self.perceptions_pub.publish(perc_array_msg)
 
-    def _init_trinity_perception(self):
-        """Set up the corrected trinity Perception output.
+    def _init_perception_output(self):
+        """Set up the corrected Perception output.
 
         Publishes PerceptionArray on the topic prediction_node actually
         subscribes to, with locations in metres NED and target_entity_id
         filled from the mission briefing.
         """
 
-        topic = self.get_parameter('trinity_perception_topic').value
-        self.trinity_pub = self.create_publisher(
+        topic = self.get_parameter('perception_output_topic').value
+        self.perception_output_pub = self.create_publisher(
             PerceptionArray, topic, PERCEPTION_QOS)
-        self.get_logger().info(f"Trinity Perception output on: {topic}")
+        self.get_logger().info(f"Perception output on: {topic}")
 
         # --- world projection -----------------------------------------
         self.projector = GroundProjector(
@@ -508,8 +507,8 @@ class GroundingDINONode(Node):
                 f"Depth stream active ({msg.width}x{msg.height}, "
                 f"{msg.encoding}): projecting with depth")
 
-    def _publish_trinity_perception(self, tracks, image_msg, img_h, img_w, frame_bgr):
-        """Publish the corrected trinity PerceptionArray.
+    def _publish_perception_output(self, tracks, image_msg, img_h, img_w, frame_bgr):
+        """Publish the corrected PerceptionArray.
 
         Differs from _publish_tracks in every field that matters:
           - stamp is the image's sim-clock stamp, not wall clock
@@ -564,7 +563,7 @@ class GroundingDINONode(Node):
                 set_field=_set_if_present,
             ))
 
-        self.trinity_pub.publish(msg)
+        self.perception_output_pub.publish(msg)
         self._log_projection_methods(methods)
 
     def _project_track(self, track, img_h, img_w):

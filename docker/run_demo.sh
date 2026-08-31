@@ -94,7 +94,7 @@ if [ "${OTHER:-0}" -gt 0 ]; then
 fi
 
 echo "========================================"
-echo "GroundingDINO -> trinity Perception"
+echo "GroundingDINO -> Perception"
 echo "========================================"
 echo "video:    $VIDEO"
 echo "source:   ${SRC_FRAMES} frames, recorded at ${SRC_FPS} fps"

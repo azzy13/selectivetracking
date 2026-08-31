@@ -100,13 +100,13 @@ RUN git clone https://github.com/microsoft/MoGe.git /tmp/moge_src && \
 # Stage 3: Build ROS2 workspace
 WORKDIR /app/ros2_ws
 
-# Copy ROS2 packages (trinity_msgs staged by build_ros2.sh into _trinity_msgs_build/)
+# Copy ROS2 packages (msgs staged by build_ros2.sh into _msgs_build/)
 COPY ros2_package/groundingdino_ros /app/ros2_ws/src/groundingdino_ros
-COPY _trinity_msgs_build /app/ros2_ws/src/trinity_msgs
+COPY _msgs_build /app/ros2_ws/src/msgs
 
-# Build trinity_msgs first (groundingdino_ros depends on it)
+# Build msgs first (groundingdino_ros depends on it)
 RUN /bin/bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && \
-    colcon build --packages-select trinity_msgs groundingdino_ros --symlink-install"
+    colcon build --packages-select msgs groundingdino_ros --symlink-install"
 
 # Setup entrypoint
 COPY docker/ros2_entrypoint.sh /app/ros2_entrypoint.sh

@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Runs the pipeline on a short sample video and echoes one PerceptionArray
-# from the trinity output topic, so the field mapping can be eyeballed.
+# from the perception output topic, so the field mapping can be eyeballed.
 #
 # Everything runs inside one container against a stub AirSim publisher --
 # no simulator required. Usage:
@@ -75,8 +75,8 @@ source /app/ros2_ws/install/setup.bash
 export PYTHONPATH=/app/GroundingDINO:/app/GroundingDINO/eval:\$PYTHONPATH
 cd /app/GroundingDINO
 
-echo '--- trinity_msgs revision built into this image ---'
-ros2 interface show trinity_msgs/msg/Perception
+echo '--- msgs definitions built into this image ---'
+ros2 interface show msgs/msg/Perception
 echo ''
 
 echo '--- starting groundingdino node ---'
@@ -124,7 +124,7 @@ timeout 60 ros2 topic echo --once --full-length \
 
 echo ''
 echo '--- node log (projection path, entities) ---'
-grep -E 'Trinity|Projecting|Depth stream|entities|Entities|CameraInfo|prompt' \
+grep -E 'Perception|Projecting|Depth stream|entities|Entities|CameraInfo|prompt' \
     /tmp/node.log | tail -20 || true
 
 kill \$STUB_PID \$NODE_PID 2>/dev/null || true

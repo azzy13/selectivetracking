@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run the query parser over the ANSR benchmark episode prompts and print a
+Run the query parser over the benchmark episode prompts and print a
 human-readable report.
 
 Reads the ``task`` string out of every ``description.json`` in an episode
@@ -451,7 +451,7 @@ def main(argv=None) -> int:
     else:
         header = (
             HEAVY + "\n"
-            "QUERY PARSER  ·  ANSR benchmark episode prompts\n"
+            "QUERY PARSER  ·  benchmark episode prompts\n"
             f"episodes: {args.episodes}\n"
             + HEAVY + "\n\n"
         )

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal AirSim stand-in for checking the trinity Perception output.
+Minimal AirSim stand-in for checking the Perception output.
 
 Publishes everything groundingdino_node needs to place a track in the
 world, so the output can be inspected without the simulator running:
@@ -32,7 +32,7 @@ from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CameraInfo, Image
 from cv_bridge import CvBridge
-from trinity_msgs.msg import PerceptionArray
+from msgs.msg import PerceptionArray
 
 PREFIX = "/viaduct/Sim/SceneDroneSensors/robots/Drone1"
 SCENE_TOPIC = f"{PREFIX}/sensors/front_center1/scene_camera/image"

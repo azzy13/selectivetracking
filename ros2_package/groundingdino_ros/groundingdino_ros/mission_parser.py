@@ -2,7 +2,7 @@
 Mission config parser for extracting text prompts and entities of interest
 from a mission briefing.
 
-Real ANSR mission briefings (/mission_briefing/config.json, and the
+Real mission briefings (/mission_briefing/config.json, and the
 scenario description.json) describe targets as:
 
     {"entities_of_interest": [

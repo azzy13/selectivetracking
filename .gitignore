@@ -153,7 +153,6 @@ debug*/
 outputs_compare/
 output/
 docs/
-.claude/
 notebooks_debug/
 dump/
 # pixi environments
@@ -161,4 +160,4 @@ dump/
 !.pixi/config.toml
 
 # Staging dir created by docker/build_ros2.sh (removed on exit)
-_trinity_msgs_build/
+_msgs_build/

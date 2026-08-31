@@ -1,11 +1,11 @@
 """
-Assembles trinity_msgs/PerceptionArray from GroundingDINO tracks.
+Assembles msgs/PerceptionArray from GroundingDINO tracks.
 
 Kept separate from the ROS2 node so the field mapping is testable without
 a running ROS graph: everything here is plain Python over track objects,
 scene-graph nodes and EntityOfInterest records.
 
-Field mapping (trinity_msgs 0.22, the revision the running stack pins):
+Field mapping:
 
     tracking_id       ByteTrack track id, wrapped to uint16
     target_entity_id  episode entity_id, only on a class+colour match
@@ -16,8 +16,8 @@ Field mapping (trinity_msgs 0.22, the revision the running stack pins):
     entity_color      scene-graph colour, in the benchmark's vocabulary
     match_prob        scene-graph mission score for the matched entity
 
-Perception.frame_number exists in 0.58 but not in 0.22, so it is set only
-when the built message defines it.
+Perception.frame_number is optional and is not in this repo's definitions,
+so it is set only when the built message defines it.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def build_perception(
     match_prob: float,
     set_field,
 ):
-    """Fill one trinity_msgs/Perception from a track.
+    """Fill one msgs/Perception from a track.
 
     location is metres NED, or None when projection failed -- in which
     case the message carries zeros, which is what an unset float32[3] is
@@ -110,7 +110,7 @@ def build_perception(
     msg.entity_color = entity_color
     msg.match_prob = float(match_prob)
 
-    # 0.58 has these; the pinned 0.22 does not.
+    # Optional; absent from this repo's definitions.
     set_field(msg, "frame_number", int(frame_number) % UINT16_MODULUS)
     set_field(msg, "occlusion", "")
     set_field(msg, "pose", "")
