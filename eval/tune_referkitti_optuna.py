@@ -53,7 +53,7 @@ IDF1_WEIGHT = 0.4
 def run_eval(box_thresh, text_thresh, track_thresh, match_thresh, track_buffer,
              lambda_weight, use_clip_in_high, use_clip_in_low,
              text_gate_mode, text_gate_weight,
-             referring_mode, referring_topk, referring_thresh,
+             referring_mode, referring_thresh,
              small_box_area_thresh, use_color_filter, use_spatial_filter,
              *, devices="0,1", jobs=2, fp16=True, show_output=False):
     """
@@ -70,8 +70,7 @@ def run_eval(box_thresh, text_thresh, track_thresh, match_thresh, track_buffer,
         use_clip_in_low: Use CLIP in low-confidence stage
         text_gate_mode: Text-grounding mode ("penalty" or "hard")
         text_gate_weight: Text-grounding weight
-        referring_mode: Referring filter mode ("topk", "threshold", "none")
-        referring_topk: Top-K for referring filter
+        referring_mode: Referring filter mode ("threshold", "none")
         referring_thresh: Threshold for referring filter
         small_box_area_thresh: Scale-aware area threshold
         use_color_filter: Enable color filtering
@@ -125,9 +124,7 @@ def run_eval(box_thresh, text_thresh, track_thresh, match_thresh, track_buffer,
 
     # Referring filter
     cmd.extend(["--referring_mode", referring_mode])
-    if referring_mode == "topk":
-        cmd.extend(["--referring_topk", str(referring_topk)])
-    elif referring_mode == "threshold":
+    if referring_mode == "threshold":
         cmd.extend(["--referring_thresh", str(referring_thresh)])
 
     # Scale-aware threshold
@@ -204,7 +201,6 @@ def objective(trial):
 
     # Referring filter (always use threshold mode) - FULL RANGE EXPLORATION
     referring_mode = "threshold"
-    referring_topk = 3  # Not used in threshold mode
     referring_thresh = trial.suggest_float("referring_thresh", 0.0, 0.9)
 
     # Scale-aware detection - FULL RANGE EXPLORATION
@@ -219,7 +215,7 @@ def objective(trial):
         box_threshold, text_threshold, track_thresh, match_thresh, track_buffer,
         lambda_weight, use_clip_in_high, use_clip_in_low,
         text_gate_mode, text_gate_weight,
-        referring_mode, referring_topk, referring_thresh,
+        referring_mode, referring_thresh,
         small_box_area_thresh, use_color_filter, use_spatial_filter,
         devices="0,1", jobs=2, fp16=True, show_output=False
     )
